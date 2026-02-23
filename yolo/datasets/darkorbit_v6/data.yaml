@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 72
+names: ['AllyPlayer', 'AmmoDisplay', 'BonusBox', 'BoostersWindow', 'Button', 'CargoBox', 'ChatBox', 'ChatWindow', 'Drone_havoc', 'Drone_iris', 'Drone_vandal', 'EnemyPlayer', 'Enemy_npc_boss_devolarium', 'Enemy_npc_boss_kristalin', 'Enemy_npc_boss_kristalion', 'Enemy_npc_devolarium', 'Enemy_npc_elite_saimon', 'Enemy_npc_elite_sylox', 'Enemy_npc_kristalin', 'Enemy_npc_kristalion', 'Enemy_npc_mordon', 'Enemy_npc_saimon', 'Enemy_npc_sibelon', 'Enemy_npc_sylox', 'Enemy_npc_uber_kristallion', 'Enemy_target', 'EquipmentWindow', 'Explosion', 'GroupWindow', 'Hotbar', 'HotbarWindow', 'Lasers', 'LogWindow', 'MenuBar', 'Minimap', 'MissionObjective', 'MissionsWindow', 'Planet', 'Player', 'PlayerShip', 'Portal', 'Portal_btn', 'Saimon', 'ShipWindow', 'Ship_bigboy', 'Ship_goliath', 'Ship_lenov', 'Ship_nostromo', 'Ship_phoenix', 'Ship_piranha', 'Ship_senitel', 'Ship_solace', 'Ship_venegance', 'Ship_vengeance', 'Ship_venom', 'Sidebar_menu', 'Space_station', 'Streuner', 'UserInfo', 'UserWindow', 'damage_numbers', 'drone_hercules', 'enemy_npc_boss_streuner', 'enemy_npc_streuneR', 'enemy_npc_streuner', 'enemy_npc_uber_kristallon', 'lasers_sab', 'mine', 'module_repair', 'ore', 'ore_palladium', 'sidebar_menu']
+
+roboflow:
+  workspace: bot-nc2ql
+  project: bot-waacd
+  version: 13
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/bot-nc2ql/bot-waacd/dataset/13

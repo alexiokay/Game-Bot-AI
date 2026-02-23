@@ -1,0 +1,37 @@
+# Bootstrap Dataset for YOLO Training
+# Generated: 2026-01-22T18:17:16.986194
+# Phase: discovery
+# LLM: local
+# Classes: 26
+
+path: F:\dev\bot\darkorbit_bot\data\bootstrap
+train: images
+val: images
+
+names:
+  0: PlayerShip
+  1: Streuner
+  2: Lordakia
+  3: Saimon
+  4: BonusBox
+  5: CargoBox
+  6: Portal
+  7: Planet
+  8: Minimap
+  9: ShipWindow
+  10: ChatWindow
+  11: MenuBar
+  12: GroupWindow
+  13: UserWindow
+  14: LogWindow
+  15: Hotbar
+  16: EnemyPlayer
+  17: AllyPlayer
+  18: Ignore
+  19: Sibelon
+  20: Kristallin
+  21: Drone
+  22: Explosion
+  23: MissionObjective
+  24: Asteroid
+  25: RedFramedObject

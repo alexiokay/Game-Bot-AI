@@ -1,0 +1,4 @@
+{
+  "default_model": "F:\\dev\\bot\\yolo\\runs\\darkorbit_v6_yolo26m_improved4\\weights\\best.pt",
+  "input_dir": "F:\\dev\\bot\\yolo\\datasets\\darkorbit_v7_simple\\train"
+}

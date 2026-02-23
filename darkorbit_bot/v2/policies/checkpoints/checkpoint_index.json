@@ -1,0 +1,37 @@
+[
+  {
+    "filename": "executor_v1_0.0538.pt",
+    "score": 0.053797051753036416,
+    "timestamp": "20260125_154905",
+    "version": 1,
+    "step": 27
+  },
+  {
+    "filename": "executor_v2_0.1849.pt",
+    "score": 0.18485918137081384,
+    "timestamp": "20260125_160020",
+    "version": 2,
+    "step": 16
+  },
+  {
+    "filename": "executor_v3_0.0640.pt",
+    "score": 0.06401458840532726,
+    "timestamp": "20260125_160405",
+    "version": 3,
+    "step": 9
+  },
+  {
+    "filename": "executor_v4_0.1167.pt",
+    "score": 0.11666100216016174,
+    "timestamp": "20260125_161708",
+    "version": 4,
+    "step": 6
+  },
+  {
+    "filename": "executor_v5_0.0972.pt",
+    "score": 0.09723006784309651,
+    "timestamp": "20260218_144826",
+    "version": 5,
+    "step": 19
+  }
+]

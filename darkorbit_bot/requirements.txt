@@ -1,0 +1,14 @@
+# Recording & Analysis
+pynput>=1.7.6
+numpy>=1.24.0
+scipy>=1.10.0
+keyboard>=0.13.5  # Optional backup for hotkeys (requires admin on Windows)
+
+# Screen Capture
+mss>=9.0.0
+
+# Object Detection (install when ready for Phase 3)
+# ultralytics>=8.0.0
+
+# Windows-specific (optional, for window detection)
+# pywin32>=306

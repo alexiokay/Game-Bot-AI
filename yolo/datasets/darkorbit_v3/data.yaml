@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 50
+names: ['AllyPlayer', 'AmmoDisplay', 'BonusBox', 'Button', 'ChatWindow', 'Drone', 'Drone_havoc', 'Drone_iris', 'Drone_vandal', 'Enemy_npc_boss_kristalion', 'Enemy_npc_devolarium', 'Enemy_npc_elite_saimon', 'Enemy_npc_elite_sylox', 'Enemy_npc_kristalin', 'Enemy_npc_kristalion', 'Enemy_npc_mordon', 'Enemy_npc_saimon', 'Enemy_npc_sibelon', 'Enemy_npc_sylox', 'Enemy_npc_uber_kristallion', 'Enemy_target', 'Explosion', 'GroupWindow', 'Hotbar', 'HotbarWindow', 'Lasers', 'LogWindow', 'MenuBar', 'Minimap', 'MissionObjective', 'MissionsWindow', 'Planet', 'Player', 'PlayerShip', 'Portal', 'Portal_btn', 'ShipWindow', 'Ship_bigboy', 'Ship_goliath', 'Ship_solace', 'Ship_venegance', 'Ship_venom', 'Sibelon', 'Sidebar_menu', 'Streuner', 'UserInfo', 'UserWindow', 'damage_numbers', 'enemy_npc_uber_kristallon', 'ore']
+
+roboflow:
+  workspace: bot-nc2ql
+  project: my-first-project-rwqq4
+  version: 7
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/bot-nc2ql/my-first-project-rwqq4/dataset/7

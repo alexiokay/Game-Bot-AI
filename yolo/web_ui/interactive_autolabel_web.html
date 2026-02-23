@@ -1,0 +1,1105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Auto-Label</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: #1e1e1e;
+            color: #fff;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .container {
+            display: grid;
+            grid-template-columns: 350px 1fr;
+            height: 100vh;
+        }
+
+        .sidebar {
+            background: #252526;
+            border-right: 1px solid #3e3e42;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .sidebar-header {
+            padding: 20px;
+            border-bottom: 1px solid #3e3e42;
+        }
+
+        .sidebar-header h1 {
+            font-size: 18px;
+            margin-bottom: 15px;
+        }
+
+        .global-slider-container {
+            margin-bottom: 15px;
+        }
+
+        .global-slider-container label {
+            display: block;
+            font-size: 12px;
+            color: #ccc;
+            margin-bottom: 5px;
+        }
+
+        .slider-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            user-select: none;
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+        }
+
+        input[type="range"] {
+            flex: 1;
+            height: 6px;
+            border-radius: 3px;
+            background: #3e3e42;
+            outline: none;
+            -webkit-appearance: none;
+            cursor: pointer;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #007acc;
+            cursor: pointer;
+        }
+
+        input[type="range"]::-moz-range-thumb {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #007acc;
+            cursor: pointer;
+            border: none;
+        }
+
+        .slider-value {
+            font-size: 13px;
+            color: #fff;
+            min-width: 50px;
+            width: 50px;
+            text-align: center;
+            background: #3e3e42;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            padding: 4px 6px;
+            outline: none;
+        }
+
+        .slider-value:focus {
+            border-color: #007acc;
+            background: #2d2d30;
+        }
+
+        .slider-value:hover {
+            background: #4e4e52;
+        }
+
+        .stats {
+            font-size: 11px;
+            color: #888;
+            margin-top: 10px;
+        }
+
+        .sliders-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 15px 20px;
+        }
+
+        .sliders-container::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .sliders-container::-webkit-scrollbar-track {
+            background: #252526;
+        }
+
+        .sliders-container::-webkit-scrollbar-thumb {
+            background: #3e3e42;
+            border-radius: 4px;
+        }
+
+        .sliders-container::-webkit-scrollbar-thumb:hover {
+            background: #4e4e52;
+        }
+
+        .class-slider {
+            margin-bottom: 20px;
+        }
+
+        .class-slider label {
+            display: block;
+            font-size: 13px;
+            color: #ccc;
+            margin-bottom: 5px;
+        }
+
+        .main-content {
+            display: flex;
+            flex-direction: column;
+            background: #1e1e1e;
+        }
+
+        .canvas-container {
+            flex: 1;
+            position: relative;
+            overflow: hidden;
+        }
+
+        canvas {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+        }
+
+        .controls {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px;
+            background: #252526;
+            border-top: 1px solid #3e3e42;
+        }
+
+        .nav-buttons {
+            display: flex;
+            gap: 10px;
+        }
+
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .btn-prev, .btn-next {
+            background: #3e3e42;
+            color: #fff;
+        }
+
+        .btn-prev:hover, .btn-next:hover {
+            background: #4e4e52;
+        }
+
+        .btn-prev:disabled, .btn-next:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-accept {
+            background: #0e7e3e;
+            color: #fff;
+        }
+
+        .btn-accept:hover {
+            background: #10933e;
+        }
+
+        .btn-reject {
+            background: #c72b2b;
+            color: #fff;
+        }
+
+        .btn-reject:hover {
+            background: #d73838;
+        }
+
+        .btn-export {
+            background: #007acc;
+            color: #fff;
+        }
+
+        .btn-export:hover {
+            background: #0098ff;
+        }
+
+        .image-info {
+            font-size: 13px;
+            color: #ccc;
+        }
+
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 16px;
+            color: #888;
+        }
+
+        .error {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 14px;
+            color: #c72b2b;
+            text-align: center;
+            max-width: 80%;
+        }
+
+        select {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            background: #3e3e42;
+            color: #fff;
+            font-size: 13px;
+            cursor: pointer;
+            margin-bottom: 10px;
+        }
+
+        select:hover {
+            background: #4e4e52;
+        }
+
+        .model-info {
+            font-size: 11px;
+            color: #888;
+            margin-bottom: 15px;
+        }
+
+        /* Folder browser modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal-overlay.show {
+            display: flex;
+        }
+
+        .modal-content {
+            background: #252526;
+            border: 1px solid #3e3e42;
+            border-radius: 6px;
+            width: 600px;
+            max-height: 80vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .modal-header {
+            padding: 15px 20px;
+            border-bottom: 1px solid #3e3e42;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .modal-header h2 {
+            font-size: 16px;
+            margin: 0;
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            color: #ccc;
+            font-size: 20px;
+            cursor: pointer;
+            padding: 0;
+            width: 24px;
+            height: 24px;
+            line-height: 24px;
+            text-align: center;
+        }
+
+        .modal-close:hover {
+            color: #fff;
+        }
+
+        .modal-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+
+        .current-path {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 15px;
+            padding: 8px;
+            background: #1e1e1e;
+            border-radius: 4px;
+            word-break: break-all;
+        }
+
+        .folder-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+
+        .folder-item {
+            padding: 10px;
+            margin-bottom: 5px;
+            background: #3e3e42;
+            border-radius: 4px;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: background 0.2s;
+        }
+
+        .folder-item:hover {
+            background: #4e4e52;
+        }
+
+        .folder-item-name {
+            font-size: 13px;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .folder-item-name::before {
+            content: '📁';
+            font-size: 16px;
+        }
+
+        .folder-item-count {
+            font-size: 11px;
+            color: #888;
+        }
+
+        .modal-footer {
+            padding: 15px 20px;
+            border-top: 1px solid #3e3e42;
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+        }
+
+        .modal-footer button {
+            flex: 1;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <h1>Auto-Label Review</h1>
+
+                <div class="model-selector-container">
+                    <label>YOLO Model</label>
+                    <select id="modelSelector">
+                        <option value="">Loading models...</option>
+                    </select>
+                    <div class="model-info" id="modelInfo"></div>
+                </div>
+
+                <div class="folder-selector-container" style="margin-bottom: 15px;">
+                    <label>Image Folder</label>
+                    <div style="display: flex; gap: 5px; margin-bottom: 5px;">
+                        <input type="text" id="folderInput" placeholder="F:/dev/bot/yolo/training_screenshots"
+                               style="flex: 1; padding: 6px; background: #3e3e42; border: 1px solid #3e3e42;
+                                      color: #fff; border-radius: 4px; font-size: 12px;">
+                        <button id="browseFolderBtn" style="padding: 6px 12px; font-size: 13px;">Browse...</button>
+                    </div>
+                    <button id="loadFolderBtn" style="width: 100%; padding: 8px; font-size: 13px;">Load Folder</button>
+                </div>
+
+                <div class="global-slider-container">
+                    <label>Global Confidence Threshold</label>
+                    <div class="slider-row">
+                        <input type="range" id="globalSlider" min="0" max="1" step="0.01" value="0.30">
+                        <input type="number" class="slider-value" id="globalValue" min="0" max="1" step="0.01" value="0.30">
+                    </div>
+                </div>
+
+                <div class="stats">
+                    <div>Accepted: <span id="acceptedCount">0</span></div>
+                    <div>Rejected: <span id="rejectedCount">0</span></div>
+                    <div>Pending: <span id="pendingCount">0</span></div>
+                </div>
+            </div>
+
+            <div class="sliders-container" id="slidersContainer">
+                <!-- Class sliders will be added here dynamically -->
+            </div>
+        </div>
+
+        <div class="main-content">
+            <div class="canvas-container">
+                <canvas id="canvas"></canvas>
+                <div class="loading" id="loading">Loading...</div>
+                <div class="error" id="error" style="display: none;"></div>
+            </div>
+
+            <div class="controls">
+                <div class="nav-buttons">
+                    <button class="btn-prev" id="prevBtn">Previous</button>
+                    <button class="btn-next" id="nextBtn">Next</button>
+                </div>
+
+                <div class="image-info">
+                    <span id="imageInfo">Image 0 of 0</span>
+                </div>
+
+                <div class="nav-buttons">
+                    <button class="btn-reject" id="rejectBtn">Reject</button>
+                    <button class="btn-accept" id="acceptBtn">Accept</button>
+                    <button class="btn-export" id="exportBtn">Export Labels</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Folder Browser Modal -->
+    <div class="modal-overlay" id="folderModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Select Folder</h2>
+                <button class="modal-close" id="modalClose">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="current-path" id="currentPath">Loading...</div>
+                <ul class="folder-list" id="folderList">
+                    <li style="text-align: center; color: #888; padding: 20px;">Loading folders...</li>
+                </ul>
+            </div>
+            <div class="modal-footer">
+                <button id="modalCancel" style="background: #3e3e42; color: #fff;">Cancel</button>
+                <button id="modalSelect" style="background: #007acc; color: #fff;">Select This Folder</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const API_URL = 'http://localhost:5000';
+
+        // State
+        let currentImageIndex = 0;
+        let images = [];
+        let classNames = [];
+        let classThresholds = {};
+        let decisions = {}; // {imageIndex: 'accept' | 'reject'}
+        let currentDetections = null;
+
+        // DOM Elements
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const loading = document.getElementById('loading');
+        const errorDiv = document.getElementById('error');
+        const globalSlider = document.getElementById('globalSlider');
+        const globalValue = document.getElementById('globalValue');
+        const slidersContainer = document.getElementById('slidersContainer');
+        const imageInfo = document.getElementById('imageInfo');
+        const prevBtn = document.getElementById('prevBtn');
+        const nextBtn = document.getElementById('nextBtn');
+        const acceptBtn = document.getElementById('acceptBtn');
+        const rejectBtn = document.getElementById('rejectBtn');
+        const exportBtn = document.getElementById('exportBtn');
+        const acceptedCount = document.getElementById('acceptedCount');
+        const rejectedCount = document.getElementById('rejectedCount');
+        const pendingCount = document.getElementById('pendingCount');
+        const modelSelector = document.getElementById('modelSelector');
+        const modelInfo = document.getElementById('modelInfo');
+        const folderInput = document.getElementById('folderInput');
+        const loadFolderBtn = document.getElementById('loadFolderBtn');
+        const browseFolderBtn = document.getElementById('browseFolderBtn');
+        const folderModal = document.getElementById('folderModal');
+        const modalClose = document.getElementById('modalClose');
+        const modalCancel = document.getElementById('modalCancel');
+        const modalSelect = document.getElementById('modalSelect');
+        const currentPath = document.getElementById('currentPath');
+        const folderList = document.getElementById('folderList');
+
+        let modalCurrentPath = 'F:/dev/bot/yolo';
+
+        // Browse folder button - opens modal
+        browseFolderBtn.addEventListener('click', async () => {
+            folderModal.classList.add('show');
+            await loadFolderBrowser(modalCurrentPath);
+        });
+
+        // Close modal
+        modalClose.addEventListener('click', () => {
+            folderModal.classList.remove('show');
+        });
+
+        modalCancel.addEventListener('click', () => {
+            folderModal.classList.remove('show');
+        });
+
+        // Close modal on overlay click
+        folderModal.addEventListener('click', (e) => {
+            if (e.target === folderModal) {
+                folderModal.classList.remove('show');
+            }
+        });
+
+        // Select folder
+        modalSelect.addEventListener('click', () => {
+            folderInput.value = modalCurrentPath;
+            folderModal.classList.remove('show');
+        });
+
+        // Load folder browser
+        async function loadFolderBrowser(path) {
+            try {
+                folderList.innerHTML = '<li style="text-align: center; color: #888; padding: 20px;">Loading...</li>';
+
+                const res = await fetch(`${API_URL}/browse_folders`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: path })
+                });
+
+                const data = await res.json();
+
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+
+                modalCurrentPath = data.current;
+                currentPath.textContent = data.current;
+
+                // Build folder list
+                folderList.innerHTML = '';
+
+                // Add parent directory if available
+                if (data.parent) {
+                    const li = document.createElement('li');
+                    li.className = 'folder-item';
+                    li.innerHTML = `
+                        <div class="folder-item-name" style="color: #888;">
+                            ⬆️ Parent folder
+                        </div>
+                    `;
+                    li.addEventListener('click', () => {
+                        loadFolderBrowser(data.parent);
+                    });
+                    folderList.appendChild(li);
+                }
+
+                // Add subdirectories
+                if (data.folders.length === 0) {
+                    const li = document.createElement('li');
+                    li.style.textAlign = 'center';
+                    li.style.color = '#888';
+                    li.style.padding = '20px';
+                    li.textContent = 'No subdirectories found';
+                    folderList.appendChild(li);
+                } else {
+                    data.folders.forEach(folder => {
+                        const li = document.createElement('li');
+                        li.className = 'folder-item';
+                        li.innerHTML = `
+                            <div class="folder-item-name">${folder.name}</div>
+                            <div class="folder-item-count">${folder.image_count} images</div>
+                        `;
+                        li.addEventListener('click', () => {
+                            loadFolderBrowser(folder.path);
+                        });
+                        folderList.appendChild(li);
+                    });
+                }
+
+            } catch (error) {
+                folderList.innerHTML = `<li style="text-align: center; color: #c72b2b; padding: 20px;">Error: ${error.message}</li>`;
+            }
+        }
+
+        // Load folder button
+        loadFolderBtn.addEventListener('click', async () => {
+            const folderPath = folderInput.value.trim();
+            if (!folderPath) {
+                alert('Please enter a folder path');
+                return;
+            }
+
+            showLoading();
+            try {
+                const res = await fetch(`${API_URL}/set_folder`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ folder_path: folderPath })
+                });
+
+                const data = await res.json();
+
+                if (data.success) {
+                    // Reload images
+                    const imagesRes = await fetch(`${API_URL}/images`);
+                    images = await imagesRes.json();
+
+                    if (images.length > 0) {
+                        currentImageIndex = 0;
+                        decisions = {};
+                        await loadImage(0);
+                        updateStats();
+                    } else {
+                        showError('No images found in folder');
+                    }
+                } else {
+                    throw new Error(data.error || 'Failed to load folder');
+                }
+            } catch (error) {
+                showError(`Failed to load folder: ${error.message}`);
+            }
+        });
+
+        // Initialize
+        async function init() {
+            try {
+                showLoading();
+
+                // Load available models first
+                await loadModels();
+
+                // Load images list and class names
+                const [imagesRes, classesRes] = await Promise.all([
+                    fetch(`${API_URL}/images`),
+                    fetch(`${API_URL}/classes`)
+                ]);
+
+                images = await imagesRes.json();
+                classNames = await classesRes.json();
+
+                // Initialize class thresholds
+                classNames.forEach(name => {
+                    classThresholds[name] = 0.30;
+                });
+
+                // Create class sliders
+                createClassSliders();
+
+                // Load first image
+                await loadImage(0);
+
+                hideLoading();
+                updateStats();
+            } catch (error) {
+                showError(`Failed to initialize: ${error.message}`);
+            }
+        }
+
+        // Load available models
+        async function loadModels() {
+            try {
+                const res = await fetch(`${API_URL}/models`);
+                const data = await res.json();
+
+                modelSelector.innerHTML = '';
+
+                if (data.models.length === 0) {
+                    modelSelector.innerHTML = '<option value="">No models found</option>';
+                    modelInfo.textContent = 'Please train a model first';
+                    return;
+                }
+
+                data.models.forEach(model => {
+                    const option = document.createElement('option');
+                    option.value = model.path;
+                    option.textContent = `${model.name} (${model.type})`;
+                    if (model.path === data.current) {
+                        option.selected = true;
+                    }
+                    modelSelector.appendChild(option);
+                });
+
+                updateModelInfo(data.current);
+            } catch (error) {
+                modelSelector.innerHTML = '<option value="">Error loading models</option>';
+                modelInfo.textContent = error.message;
+            }
+        }
+
+        // Update model info display
+        function updateModelInfo(modelPath) {
+            if (!modelPath) {
+                modelInfo.textContent = '';
+                return;
+            }
+            const modelName = modelPath.split(/[\\/]/).slice(-3, -1).join('/');
+            modelInfo.textContent = `Classes: ${classNames.length}`;
+        }
+
+        // Handle model selection change
+        modelSelector.addEventListener('change', async (e) => {
+            const modelPath = e.target.value;
+            if (!modelPath) return;
+
+            showLoading();
+            try {
+                const res = await fetch(`${API_URL}/models/select`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model_path: modelPath })
+                });
+
+                const data = await res.json();
+
+                if (data.success) {
+                    // Update class names
+                    classNames = data.classes;
+
+                    // Reinitialize thresholds
+                    classThresholds = {};
+                    classNames.forEach(name => {
+                        classThresholds[name] = 0.30;
+                    });
+
+                    // Recreate sliders
+                    createClassSliders();
+
+                    // Reset global slider
+                    globalSlider.value = 0.30;
+                    globalValue.textContent = '0.30';
+
+                    // Update model info
+                    updateModelInfo(modelPath);
+
+                    // Reload current image
+                    if (images.length > 0) {
+                        await loadImage(currentImageIndex);
+                    }
+
+                    hideLoading();
+                } else {
+                    throw new Error(data.error || 'Failed to load model');
+                }
+            } catch (error) {
+                showError(`Failed to switch model: ${error.message}`);
+            }
+        });
+
+        // Create class sliders
+        function createClassSliders() {
+            slidersContainer.innerHTML = '';
+
+            classNames.forEach(className => {
+                const div = document.createElement('div');
+                div.className = 'class-slider';
+                div.innerHTML = `
+                    <label>${className}</label>
+                    <div class="slider-row">
+                        <input type="range" min="0" max="1" step="0.01" value="0.30" data-class="${className}">
+                        <input type="number" class="slider-value" min="0" max="1" step="0.01" value="0.30" data-class="${className}">
+                    </div>
+                `;
+
+                const slider = div.querySelector('input[type="range"]');
+                const valueInput = div.querySelector('input[type="number"]');
+
+                // Slider change
+                slider.addEventListener('input', (e) => {
+                    const value = parseFloat(e.target.value);
+                    valueInput.value = value.toFixed(2);
+                    classThresholds[className] = value;
+                    renderDetections();
+                });
+
+                // Manual input change
+                valueInput.addEventListener('change', (e) => {
+                    let value = parseFloat(e.target.value);
+
+                    // Clamp value between 0 and 1
+                    if (isNaN(value)) value = 0.30;
+                    value = Math.max(0, Math.min(1, value));
+
+                    valueInput.value = value.toFixed(2);
+                    slider.value = value;
+                    classThresholds[className] = value;
+                    renderDetections();
+                });
+
+                slidersContainer.appendChild(div);
+            });
+        }
+
+        // Global slider
+        globalSlider.addEventListener('input', (e) => {
+            const value = parseFloat(e.target.value);
+            globalValue.value = value.toFixed(2);
+
+            // Update all class sliders instantly (JavaScript is fast!)
+            document.querySelectorAll('.class-slider input[type="range"]').forEach(slider => {
+                slider.value = value;
+                const valueInput = slider.parentElement.querySelector('.slider-value');
+                valueInput.value = value.toFixed(2);
+                const className = slider.dataset.class;
+                classThresholds[className] = value;
+            });
+
+            renderDetections();
+        });
+
+        // Global value input (manual entry)
+        globalValue.addEventListener('change', (e) => {
+            let value = parseFloat(e.target.value);
+
+            // Clamp value between 0 and 1
+            if (isNaN(value)) value = 0.30;
+            value = Math.max(0, Math.min(1, value));
+
+            globalValue.value = value.toFixed(2);
+            globalSlider.value = value;
+
+            // Update all class sliders
+            document.querySelectorAll('.class-slider input[type="range"]').forEach(slider => {
+                slider.value = value;
+                const valueInput = slider.parentElement.querySelector('.slider-value');
+                valueInput.value = value.toFixed(2);
+                const className = slider.dataset.class;
+                classThresholds[className] = value;
+            });
+
+            renderDetections();
+        });
+
+        // Load image
+        async function loadImage(index) {
+            if (index < 0 || index >= images.length) return;
+
+            currentImageIndex = index;
+            showLoading();
+
+            try {
+                // Fetch detections from backend
+                const res = await fetch(`${API_URL}/detect`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        image_path: images[index],
+                        thresholds: classThresholds
+                    })
+                });
+
+                const data = await res.json();
+                currentDetections = data;
+
+                // Load and draw image
+                const img = new Image();
+                img.onload = () => {
+                    // Resize canvas to fit image
+                    const container = canvas.parentElement;
+                    const containerWidth = container.clientWidth;
+                    const containerHeight = container.clientHeight;
+
+                    const scale = Math.min(
+                        containerWidth / img.width,
+                        containerHeight / img.height,
+                        1
+                    );
+
+                    canvas.width = img.width * scale;
+                    canvas.height = img.height * scale;
+
+                    // Draw image
+                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+                    // Draw detections
+                    renderDetections();
+
+                    hideLoading();
+                };
+                img.onerror = () => {
+                    showError('Failed to load image');
+                };
+                img.src = `${API_URL}/image/${index}`;
+
+            } catch (error) {
+                showError(`Failed to load image: ${error.message}`);
+            }
+
+            updateUI();
+        }
+
+        // Render detections on canvas
+        function renderDetections() {
+            if (!currentDetections || !currentDetections.image) return;
+
+            // Redraw image
+            const img = new Image();
+            img.onload = () => {
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+                // Draw bounding boxes
+                currentDetections.detections.forEach(det => {
+                    if (det.confidence >= classThresholds[det.class]) {
+                        const [x1, y1, x2, y2] = det.bbox;
+                        const scale = canvas.width / currentDetections.image_size.width;
+
+                        // Draw box
+                        ctx.strokeStyle = det.color;
+                        ctx.lineWidth = 2;
+                        ctx.strokeRect(
+                            x1 * scale,
+                            y1 * scale,
+                            (x2 - x1) * scale,
+                            (y2 - y1) * scale
+                        );
+
+                        // Draw label
+                        const label = `${det.class} ${det.confidence.toFixed(2)}`;
+                        ctx.fillStyle = det.color;
+                        ctx.fillRect(x1 * scale, y1 * scale - 20, ctx.measureText(label).width + 10, 20);
+                        ctx.fillStyle = '#fff';
+                        ctx.font = '12px sans-serif';
+                        ctx.fillText(label, x1 * scale + 5, y1 * scale - 5);
+                    }
+                });
+            };
+            img.src = currentDetections.image;
+        }
+
+        // Navigation
+        prevBtn.addEventListener('click', () => {
+            if (currentImageIndex > 0) {
+                loadImage(currentImageIndex - 1);
+            }
+        });
+
+        nextBtn.addEventListener('click', () => {
+            if (currentImageIndex < images.length - 1) {
+                loadImage(currentImageIndex + 1);
+            }
+        });
+
+        // Accept/Reject
+        acceptBtn.addEventListener('click', () => {
+            decisions[currentImageIndex] = 'accept';
+            updateStats();
+            if (currentImageIndex < images.length - 1) {
+                loadImage(currentImageIndex + 1);
+            }
+        });
+
+        rejectBtn.addEventListener('click', () => {
+            decisions[currentImageIndex] = 'reject';
+            updateStats();
+            if (currentImageIndex < images.length - 1) {
+                loadImage(currentImageIndex + 1);
+            }
+        });
+
+        // Export
+        exportBtn.addEventListener('click', async () => {
+            try {
+                const res = await fetch(`${API_URL}/export`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        decisions: decisions,
+                        thresholds: classThresholds
+                    })
+                });
+
+                const data = await res.json();
+                alert(`Exported ${data.count} accepted labels to ${data.output_dir}`);
+            } catch (error) {
+                alert(`Export failed: ${error.message}`);
+            }
+        });
+
+        // Update UI
+        function updateUI() {
+            imageInfo.textContent = `Image ${currentImageIndex + 1} of ${images.length}`;
+            prevBtn.disabled = currentImageIndex === 0;
+            nextBtn.disabled = currentImageIndex === images.length - 1;
+
+            // Highlight accept/reject buttons based on decision
+            const decision = decisions[currentImageIndex];
+            acceptBtn.style.opacity = decision === 'accept' ? '1' : '0.7';
+            rejectBtn.style.opacity = decision === 'reject' ? '1' : '0.7';
+        }
+
+        // Update stats
+        function updateStats() {
+            const accepted = Object.values(decisions).filter(d => d === 'accept').length;
+            const rejected = Object.values(decisions).filter(d => d === 'reject').length;
+            const pending = images.length - accepted - rejected;
+
+            acceptedCount.textContent = accepted;
+            rejectedCount.textContent = rejected;
+            pendingCount.textContent = pending;
+        }
+
+        // Loading/Error
+        function showLoading() {
+            loading.style.display = 'block';
+            errorDiv.style.display = 'none';
+            canvas.style.display = 'none';
+        }
+
+        function hideLoading() {
+            loading.style.display = 'none';
+            canvas.style.display = 'block';
+        }
+
+        function showError(message) {
+            loading.style.display = 'none';
+            canvas.style.display = 'none';
+            errorDiv.style.display = 'block';
+            errorDiv.textContent = message;
+        }
+
+        // Window resize
+        window.addEventListener('resize', () => {
+            if (currentDetections) {
+                loadImage(currentImageIndex);
+            }
+        });
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowLeft' && !prevBtn.disabled) {
+                prevBtn.click();
+            } else if (e.key === 'ArrowRight' && !nextBtn.disabled) {
+                nextBtn.click();
+            } else if (e.key === 'a' || e.key === 'A') {
+                acceptBtn.click();
+            } else if (e.key === 'r' || e.key === 'R') {
+                rejectBtn.click();
+            }
+        });
+
+        // Start
+        init();
+    </script>
+</body>
+</html>

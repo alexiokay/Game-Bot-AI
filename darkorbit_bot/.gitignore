@@ -1,0 +1,12 @@
+# Environment and local secret files
+.env
+.env.*
+*.env
+
+# Python virtual environments
+.venv/
+venv/
+
+# Local IDE/project files
+.vscode/
+.idea/
