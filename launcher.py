@@ -282,6 +282,11 @@ class BotLauncher:
             ('F7', 'Discard'),
         ],
         'training': [],  # No hotkeys during training
+        'v3': [
+            ('F1', 'Pause/Resume'),
+            ('F2', 'Takeover (you play = correction)'),
+            ('F3', 'Stop'),
+        ],
         'viewer': [
             ('Q', 'Quit'),
             ('D', 'Debug'),
@@ -452,6 +457,32 @@ class BotLauncher:
         # Left panel - Buttons (scrollable)
         left_panel = ctk.CTkScrollableFrame(main_container, width=350)
         left_panel.grid(row=0, column=0, padx=(10, 5), pady=10, sticky="nsew")
+
+        # === V3 SINGLE POLICY (recommended) ===
+        self._create_section_label(left_panel, "V3 SINGLE POLICY")
+
+        self.btn_v3_record = ctk.CTkButton(
+            left_panel, text="V3 Record (you play)", command=self.run_v3_record,
+            height=40, font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#00897B", hover_color="#00796B", text_color="white")
+        self.btn_v3_record.pack(fill="x", padx=10, pady=5)
+        self.btn_v3_record.bind("<Button-3>", lambda e: self.config_v3())
+
+        self.btn_v3_train = ctk.CTkButton(
+            left_panel, text="V3 Train Policy", command=self.run_v3_train,
+            height=40, font=ctk.CTkFont(size=13),
+            fg_color="#00897B", hover_color="#00796B", text_color="white")
+        self.btn_v3_train.pack(fill="x", padx=10, pady=5)
+        self.btn_v3_train.bind("<Button-3>", lambda e: self.config_v3())
+
+        self.btn_v3_bot = ctk.CTkButton(
+            left_panel, text="V3 Run Bot", command=self.run_v3_bot,
+            height=40, font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#00897B", hover_color="#00796B", text_color="white")
+        self.btn_v3_bot.pack(fill="x", padx=10, pady=5)
+        self.btn_v3_bot.bind("<Button-3>", lambda e: self.config_v3())
+
+        self._create_separator(left_panel)
 
         # === RECORDING SECTION ===
         self._create_section_label(left_panel, "RECORDING")
@@ -922,7 +953,8 @@ class BotLauncher:
         """Disable all action buttons except Debug Viewer (can run alongside bot)."""
         for widget in [self.btn_shadow, self.btn_record, self.btn_train_strategist,
                       self.btn_train_tactician, self.btn_train_executor, self.btn_finetune_vlm,
-                      self.btn_run_bot, self.btn_tensorboard, self.btn_data_stats, self.btn_evaluate]:
+                      self.btn_run_bot, self.btn_tensorboard, self.btn_data_stats, self.btn_evaluate,
+                      self.btn_v3_record, self.btn_v3_train, self.btn_v3_bot]:
             widget.configure(state="disabled")
         # Debug Viewer stays enabled - it's meant to connect to running bot
 
@@ -930,7 +962,8 @@ class BotLauncher:
         """Enable all action buttons."""
         for widget in [self.btn_shadow, self.btn_record, self.btn_train_strategist,
                       self.btn_train_tactician, self.btn_train_executor, self.btn_finetune_vlm,
-                      self.btn_run_bot, self.btn_debug_viewer, self.btn_tensorboard, self.btn_data_stats, self.btn_evaluate]:
+                      self.btn_run_bot, self.btn_debug_viewer, self.btn_tensorboard, self.btn_data_stats, self.btn_evaluate,
+                      self.btn_v3_record, self.btn_v3_train, self.btn_v3_bot]:
             widget.configure(state="normal")
 
     # Configuration dialogs
@@ -1201,6 +1234,53 @@ class BotLauncher:
             self.config['debug_viewer'] = result
             self.save_config()
             messagebox.showinfo("Saved", "Debug viewer configuration saved!")
+
+    # V3 single policy
+    V3_DEFAULT_POLICY = str(BOT_DIR / "models" / "v3" / "policy.pt")
+
+    def config_v3(self):
+        """Configure V3 record / train / run options (right-click any V3 button)."""
+        cfg = self.config.get('v3', {})
+        fields = [
+            ('monitor', 'Monitor Number', cfg.get('monitor', 1), 'int'),
+            ('policy', 'V3 Policy File', cfg.get('policy', self.V3_DEFAULT_POLICY), 'file'),
+            ('dry_run', 'Bot dry run (decide, send no input)', cfg.get('dry_run', True), 'bool'),
+            ('no_video', 'Record without video', cfg.get('no_video', False), 'bool'),
+            ('epochs', 'Training Epochs', cfg.get('epochs', 30), 'int'),
+            ('awr', 'Reward-weighted training (AWR)', cfg.get('awr', False), 'bool'),
+        ]
+        result = ConfigDialog(self.root, "V3 Single Policy Configuration", fields).show()
+        if result:
+            self.config['v3'] = result
+            self.save_config()
+
+    def _v3_common(self, cfg: dict) -> list:
+        cmd = ["--model", self._yolo_model_path(cfg), "--monitor", str(cfg.get('monitor', 1))]
+        if cfg.get('no_video'):
+            cmd.append("--no-video")
+        return cmd
+
+    def run_v3_record(self):
+        cfg = self.config.get('v3', {})
+        cmd = ["uv", "run", "python", "-m", "darkorbit_bot.v3.agent", "--mode", "record"] + self._v3_common(cfg)
+        self.run_command(cmd, "V3 Record", script_type='v3')
+
+    def run_v3_train(self):
+        cfg = self.config.get('v3', {})
+        cmd = ["uv", "run", "python", "-m", "darkorbit_bot.v3.train",
+               "--out", cfg.get('policy') or self.V3_DEFAULT_POLICY,
+               "--epochs", str(cfg.get('epochs', 30))]
+        if cfg.get('awr'):
+            cmd.append("--awr")
+        self.run_command(cmd, "V3 Train Policy", script_type='training')
+
+    def run_v3_bot(self):
+        cfg = self.config.get('v3', {})
+        cmd = ["uv", "run", "python", "-m", "darkorbit_bot.v3.agent", "--mode", "bot",
+               "--policy", cfg.get('policy') or self.V3_DEFAULT_POLICY] + self._v3_common(cfg)
+        if cfg.get('dry_run', True):
+            cmd.append("--dry-run")
+        self.run_command(cmd, "V3 Run Bot" + (" (dry run)" if cfg.get('dry_run', True) else ""), script_type='v3')
 
     # Command runners
     def _yolo_model_path(self, cfg: dict) -> str:
