@@ -1235,15 +1235,21 @@ class BotLauncher:
             self.save_config()
             messagebox.showinfo("Saved", "Debug viewer configuration saved!")
 
-    # V3 single policy
-    V3_DEFAULT_POLICY = str(BOT_DIR / "models" / "v3" / "policy.pt")
+    # V3 single policy (any game with a profile in games/<name>/profile.yaml)
+    def _v3_game(self, cfg: dict) -> str:
+        return (cfg.get('game') or 'darkorbit').strip()
+
+    def _v3_policy(self, cfg: dict) -> str:
+        """Explicit policy file, else models/v3/<game>/policy.pt."""
+        return cfg.get('policy') or str(BOT_DIR / "models" / "v3" / self._v3_game(cfg) / "policy.pt")
 
     def config_v3(self):
         """Configure V3 record / train / run options (right-click any V3 button)."""
         cfg = self.config.get('v3', {})
         fields = [
+            ('game', 'Game profile (games/<name>)', cfg.get('game', 'darkorbit'), 'str'),
             ('monitor', 'Monitor Number', cfg.get('monitor', 1), 'int'),
-            ('policy', 'V3 Policy File', cfg.get('policy', self.V3_DEFAULT_POLICY), 'file'),
+            ('policy', 'V3 Policy File (empty = models/v3/<game>/policy.pt)', cfg.get('policy', ''), 'file'),
             ('dry_run', 'Bot dry run (decide, send no input)', cfg.get('dry_run', True), 'bool'),
             ('no_video', 'Record without video', cfg.get('no_video', False), 'bool'),
             ('epochs', 'Training Epochs', cfg.get('epochs', 30), 'int'),
@@ -1255,7 +1261,10 @@ class BotLauncher:
             self.save_config()
 
     def _v3_common(self, cfg: dict) -> list:
-        cmd = ["--model", self._yolo_model_path(cfg), "--monitor", str(cfg.get('monitor', 1))]
+        # YOLO weights come from the game profile unless set explicitly here
+        cmd = ["--game", self._v3_game(cfg), "--monitor", str(cfg.get('monitor', 1))]
+        if cfg.get('model'):
+            cmd += ["--model", cfg['model']]
         if cfg.get('no_video'):
             cmd.append("--no-video")
         return cmd
@@ -1263,12 +1272,12 @@ class BotLauncher:
     def run_v3_record(self):
         cfg = self.config.get('v3', {})
         cmd = ["uv", "run", "python", "-m", "darkorbit_bot.v3.agent", "--mode", "record"] + self._v3_common(cfg)
-        self.run_command(cmd, "V3 Record", script_type='v3')
+        self.run_command(cmd, f"V3 Record ({self._v3_game(cfg)})", script_type='v3')
 
     def run_v3_train(self):
         cfg = self.config.get('v3', {})
         cmd = ["uv", "run", "python", "-m", "darkorbit_bot.v3.train",
-               "--out", cfg.get('policy') or self.V3_DEFAULT_POLICY,
+               "--game", self._v3_game(cfg), "--out", self._v3_policy(cfg),
                "--epochs", str(cfg.get('epochs', 30))]
         if cfg.get('awr'):
             cmd.append("--awr")
@@ -1277,7 +1286,7 @@ class BotLauncher:
     def run_v3_bot(self):
         cfg = self.config.get('v3', {})
         cmd = ["uv", "run", "python", "-m", "darkorbit_bot.v3.agent", "--mode", "bot",
-               "--policy", cfg.get('policy') or self.V3_DEFAULT_POLICY] + self._v3_common(cfg)
+               "--policy", self._v3_policy(cfg)] + self._v3_common(cfg)
         if cfg.get('dry_run', True):
             cmd.append("--dry-run")
         self.run_command(cmd, "V3 Run Bot" + (" (dry run)" if cfg.get('dry_run', True) else ""), script_type='v3')

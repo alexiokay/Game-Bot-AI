@@ -1,14 +1,16 @@
 """
 V3 agent: record your play, or let the single policy play.
 
-    python -m darkorbit_bot.v3.agent --mode record            # you play, it records
-    python -m darkorbit_bot.v3.agent --mode bot               # policy plays
-    python -m darkorbit_bot.v3.agent --mode bot --dry-run     # policy decides, nothing is sent
+    python -m darkorbit_bot.v3.agent --mode record                 # you play, it records
+    python -m darkorbit_bot.v3.agent --mode bot                    # policy plays
+    python -m darkorbit_bot.v3.agent --mode bot --dry-run          # decides, sends nothing
+    python -m darkorbit_bot.v3.agent --game my_game --mode record  # any game with a profile
 
 Hotkeys:  F1 pause   F2 takeover (bot mode: you play, recorded as a correction)   F3 stop
 
 Every run records a session (video + frames.jsonl + meta) under
-darkorbit_bot/data/v3_sessions/. The control loop runs on the main thread;
+darkorbit_bot/data/v3_sessions/<game>/. Game-specific settings (detector,
+class roles, HUD bars, keys, button behaviour) come from games/<game>/profile.yaml. The control loop runs on the main thread;
 hotkeys and signals only set flags, so stop() always finishes (inputs
 released, session closed) before the process exits.
 """
@@ -24,8 +26,8 @@ from typing import Dict, Optional
 import numpy as np
 
 from .features import FeatureBuilder, detection_to_raw
-from .schema import (RECORD_FPS, SESSIONS_DIR, DEFAULT_POLICY_PATH, DEFAULT_YOLO_MODEL,
-                     HUMAN, BOT, TAKEOVER)
+from .profile import GameProfile, load_profile, DEFAULT_GAME
+from .schema import HUMAN, BOT, TAKEOVER, sessions_dir, default_policy_path
 from .session_io import SessionWriter, file_sha1
 
 PAUSED = "paused"   # frames not learned from
@@ -38,14 +40,42 @@ def _rmb_down() -> bool:
         return False
 
 
+def hud_reader_for(profile: GameProfile):
+    """HUDReader (colour-based) configured from the profile's bars, or None."""
+    if profile.hp_bar is None and profile.shield_bar is None:
+        return None
+    from ..v2.perception.hud_ocr import HUDReader, HUDConfig
+    cfg = HUDConfig(ocr_backend="color_only")
+    none_region = (0.0, 0.0, 0.0, 0.0)   # empty region = bar not read (unknown)
+    hp, sh = profile.hp_bar, profile.shield_bar
+    cfg.hp_bar_region = hp.region if hp else none_region
+    if hp:
+        cfg.hp_color_low, cfg.hp_color_high = hp.hsv_low, hp.hsv_high
+        cfg.hp_color_critical_low, cfg.hp_color_critical_high = hp.alt_hsv_low, hp.alt_hsv_high
+    cfg.shield_bar_region = sh.region if sh else none_region
+    if sh:
+        cfg.shield_color_low, cfg.shield_color_high = sh.hsv_low, sh.hsv_high
+    return HUDReader(cfg)
+
+
+def check_policy_for_profile(model, profile: GameProfile):
+    """Refuse a policy trained for another game or key list."""
+    cfg = model.cfg
+    if cfg.game and cfg.game != profile.name:
+        raise SystemExit(f"This policy was trained for '{cfg.game}', not '{profile.name}'.")
+    if tuple(cfg.keys) != tuple(profile.keys):
+        raise SystemExit("The policy's key list differs from the profile's controls.keys - retrain it.")
+
+
 class Agent:
     def __init__(self, mode: str, capture, detector, writer: SessionWriter,
-                 input_capture, hud_reader=None, runner=None,
+                 input_capture, profile: GameProfile, hud_reader=None, runner=None,
                  mouse=None, keyboard=None, movement=None,
-                 monitor: Optional[Dict] = None, fps: int = RECORD_FPS,
+                 monitor: Optional[Dict] = None, fps: Optional[int] = None,
                  dry_run: bool = False, record_frames: bool = True):
         assert mode in ('record', 'bot')
         self.mode = mode
+        self.profile = profile
         self.capture = capture
         self.detector = detector
         self.writer = writer
@@ -56,11 +86,11 @@ class Agent:
         self.keyboard = keyboard
         self.movement = movement
         self.monitor = monitor or {'left': 0, 'top': 0, 'width': 1920, 'height': 1080}
-        self.fps = fps
+        self.fps = fps or profile.fps
         self.dry_run = dry_run
         self.record_frames = record_frames
 
-        self.features = FeatureBuilder()
+        self.features = FeatureBuilder(profile)
         self.running = False
         self.paused = False
         self.takeover = False
@@ -144,11 +174,18 @@ class Agent:
                     self.mouse.execute_path_smooth(path)
                 else:
                     self.mouse.move_to(tx, ty)
-            # Buttons as held state (DarkOrbit: hold left = fly toward cursor)
+            # Buttons: 'hold' = the predicted state is held down (DarkOrbit: hold
+            # left to fly toward the cursor); 'click' = a short tap when the
+            # prediction turns on
+            modes = {'left': self.profile.left_button, 'right': self.profile.right_button}
             for want, attr, button in ((action['lmb'], '_lmb_down', 'left'), (action['rmb'], '_rmb_down', 'right')):
-                if want != getattr(self, attr):
-                    self.mouse._send_click(want, button)
-                    setattr(self, attr, want)
+                was = getattr(self, attr)
+                if modes[button] == 'hold':
+                    if want != was:
+                        self.mouse._send_click(want, button)
+                elif want and not was:
+                    self.mouse.click(button=button, hold_duration=0.05)
+                setattr(self, attr, want)
         # Keys as held state
         if self.keyboard is not None:
             want = set(action['keys'])
@@ -265,60 +302,68 @@ class Agent:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="V3 agent: record or play")
+    ap.add_argument('--game', default=DEFAULT_GAME, help='game profile name (games/<name>/profile.yaml) or path')
     ap.add_argument('--mode', choices=['record', 'bot'], default='record')
-    ap.add_argument('--model', default=DEFAULT_YOLO_MODEL, help='YOLO weights')
-    ap.add_argument('--policy', default=str(DEFAULT_POLICY_PATH), help='V3 policy (bot mode)')
+    ap.add_argument('--model', default=None, help='YOLO weights (default: from the profile)')
+    ap.add_argument('--policy', default=None, help='V3 policy (default: models/v3/<game>/policy.pt)')
     ap.add_argument('--monitor', type=int, default=1)
-    ap.add_argument('--fps', type=int, default=RECORD_FPS)
-    ap.add_argument('--sessions-dir', default=str(SESSIONS_DIR))
+    ap.add_argument('--fps', type=int, default=None, help='default: from the profile')
+    ap.add_argument('--sessions-dir', default=None, help='default: darkorbit_bot/data/v3_sessions/<game>')
     ap.add_argument('--no-video', action='store_true', help='record detections/inputs only')
     ap.add_argument('--no-hud', action='store_true')
     ap.add_argument('--dry-run', action='store_true', help='bot decides but sends no input')
     ap.add_argument('--device', default='auto')
     args = ap.parse_args(argv)
 
+    profile = load_profile(args.game)
+    fps = args.fps or profile.fps
+    model_path = args.model or profile.detector_path()
+    policy_path = Path(args.policy) if args.policy else default_policy_path(profile.name)
+
     import torch
     device = ('cuda' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device
 
     # Perception + input capture (reused from V1/V2)
     from ..detection.detector import ScreenCapture, GameDetector
-    from ..v2.perception.hud_ocr import create_hud_reader
     from ..v2.training.shadow_trainer import HumanInputCapture
 
     capture = ScreenCapture(monitor_index=args.monitor)
     mon = capture.monitor
-    detector = GameDetector(args.model)
-    hud = None if args.no_hud else create_hud_reader(ocr_backend="color_only")
+    detector = GameDetector(model_path, confidence_threshold=profile.detector_confidence)
+    hud = None if args.no_hud else hud_reader_for(profile)
     inp = HumanInputCapture(mon['left'], mon['top'], mon['width'], mon['height'], confine_mouse=False)
 
     runner = mouse = keyboard = movement = None
     if args.mode == 'bot':
         from .model import load_policy, PolicyRunner
-        if not Path(args.policy).exists():
-            raise SystemExit(f"No V3 policy at {args.policy}. Record sessions and train first.")
-        runner = PolicyRunner(load_policy(args.policy, device), device=device)
+        if not policy_path.exists():
+            raise SystemExit(f"No V3 policy at {policy_path}. Record sessions and train first.")
+        model = load_policy(policy_path, device)
+        check_policy_for_profile(model, profile)
+        runner = PolicyRunner(model, device=device)
         if not args.dry_run:
             from ..movement.generator import (MovementGenerator, MouseController,
                                               MovementProfile, KeyboardController)
             prof_path = Path(__file__).resolve().parents[1] / "data" / "my_movement_profile.json"
             try:
-                profile = MovementProfile.load(str(prof_path)) if prof_path.exists() else MovementProfile()
+                mprof = MovementProfile.load(str(prof_path)) if prof_path.exists() else MovementProfile()
             except Exception:
-                profile = MovementProfile()
-            movement = MovementGenerator(profile)
+                mprof = MovementProfile()
+            movement = MovementGenerator(mprof)
             mouse = MouseController(mon['width'], mon['height'], game_rect=mon)
             keyboard = KeyboardController()
 
+    root = Path(args.sessions_dir) if args.sessions_dir else sessions_dir(profile.name)
     writer = SessionWriter({
         'mode': args.mode, 'dry_run': args.dry_run, 'monitor': mon,
-        'yolo_model': str(args.model), 'yolo_sha1': file_sha1(args.model),
+        'yolo_model': str(model_path), 'yolo_sha1': file_sha1(model_path),
         'class_names': getattr(detector, 'class_names', None),
-        'policy': args.policy if args.mode == 'bot' else None,
-    }, root=Path(args.sessions_dir), record_video=not args.no_video, fps=args.fps)
+        'policy': str(policy_path) if args.mode == 'bot' else None,
+    }, root=root, record_video=not args.no_video, fps=fps, video_size=profile.video_size, profile=profile)
 
-    agent = Agent(args.mode, capture, detector, writer, inp, hud_reader=hud, runner=runner,
+    agent = Agent(args.mode, capture, detector, writer, inp, profile, hud_reader=hud, runner=runner,
                   mouse=mouse, keyboard=keyboard, movement=movement, monitor=mon,
-                  fps=args.fps, dry_run=args.dry_run, record_frames=not args.no_video)
+                  fps=fps, dry_run=args.dry_run, record_frames=not args.no_video)
 
     # Ctrl+Break (launcher Stop) / SIGTERM: only ask the loop to stop
     def _sig(signum, frame):
@@ -331,7 +376,8 @@ def main(argv=None):
             except (ValueError, OSError):
                 pass
 
-    print(f"[V3] Mode: {args.mode}{' (dry run)' if args.dry_run else ''} | session {writer.session_id}")
+    print(f"[V3] Game: {profile.name} | mode: {args.mode}{' (dry run)' if args.dry_run else ''} "
+          f"| session {writer.session_id}")
     print("[V3] F1 pause | F2 takeover (bot mode) | F3 stop")
     agent.start_hotkeys()
     agent.run()

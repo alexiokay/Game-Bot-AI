@@ -1,0 +1,60 @@
+# DarkOrbit game profile for the V3 single policy.
+# Everything game-specific lives here; the learning code is game-agnostic.
+# See games/_template/profile.yaml for what every field means.
+
+name: darkorbit
+description: DarkOrbit Reloaded (browser, top-down space MMO)
+
+detector:
+  weights: best.pt            # relative to the repo root (72 classes)
+  confidence: 0.3
+  self_fallback: center       # the map scrolls around our ship
+
+# Detector class -> role. First matching rule wins (fnmatch patterns, case-sensitive).
+classes:
+  - role: self
+    match: [Player, PlayerShip]
+  # UI windows, buttons and visual effects are not game objects
+  - role: ignore
+    match: [AmmoDisplay, BoostersWindow, Button, ChatBox, ChatWindow, EquipmentWindow,
+            GroupWindow, Hotbar, HotbarWindow, LogWindow, MenuBar, Minimap,
+            MissionObjective, MissionsWindow, ShipWindow, Sidebar_menu, sidebar_menu,
+            UserInfo, UserWindow, Portal_btn, damage_numbers, Explosion, Lasers,
+            lasers_sab, "Drone_*", "drone_*"]
+  - role: enemy
+    match: ["Enemy_npc_*", "enemy_npc_*", Saimon, Streuner, EnemyPlayer]
+  - role: ally
+    match: [AllyPlayer]
+  - role: player
+    match: ["Ship_*"]
+  - role: loot
+    match: [BonusBox, CargoBox, ore, ore_palladium]
+  - role: hazard
+    match: [mine]
+  - role: interactive
+    match: [Portal, Planet, Space_station, module_repair]
+  - role: other
+    match: [Enemy_target]      # the selected-target marker
+default_role: other
+
+hud:
+  bars:
+    hp:
+      region: [0.88, 0.88, 0.99, 0.91]
+      hsv: [[35, 100, 100], [85, 255, 255]]       # green
+      alt_hsv: [[0, 100, 100], [10, 255, 255]]    # red when low
+    shield:
+      region: [0.88, 0.91, 0.99, 0.94]
+      hsv: [[85, 100, 100], [130, 255, 255]]      # cyan/blue
+
+controls:
+  mouse: absolute             # cursor position on screen
+  left_button: hold           # holding left flies toward the cursor
+  right_button: hold
+  keys: [ctrl, shift, alt, space,
+         "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
+         q, w, e, r, t, a, s, d, f, g, z, x, c, v, b, j, tab, esc]
+
+recording:
+  fps: 20
+  video_size: [960, 540]

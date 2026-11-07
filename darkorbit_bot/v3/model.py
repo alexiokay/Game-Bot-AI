@@ -10,7 +10,8 @@ Heads:
                cursor for "none") + a learned correction
     buttons  next CHUNK left/right button + key logits     [B, C, 2+K]
 
-The checkpoint stores PolicyConfig, so loading never guesses shapes.
+The checkpoint stores PolicyConfig (incl. the game and its key list), so
+loading never guesses shapes and a policy can't drive the wrong game.
 """
 
 from dataclasses import dataclass, asdict, field
@@ -21,8 +22,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .schema import (MAX_OBJECTS, OBJECT_DIM, PLAYER_DIM, ACTION_DIM, KEYS,
-                     CHUNK, REPLAN_EVERY)
+from .profile import TOKEN_ROLES, CLASS_HASH_BUCKETS
+from .schema import MAX_OBJECTS, OBJECT_DIM, PLAYER_DIM, CHUNK, REPLAN_EVERY
 
 
 @dataclass
@@ -35,12 +36,22 @@ class PolicyConfig:
     max_objects: int = MAX_OBJECTS
     object_dim: int = OBJECT_DIM
     player_dim: int = PLAYER_DIM
-    action_dim: int = ACTION_DIM
-    keys: Tuple[str, ...] = field(default_factory=lambda: tuple(KEYS))
+    game: str = ""                       # profile name the policy was trained for
+    keys: Tuple[str, ...] = ()           # profile.keys, in order
+    roles: Tuple[str, ...] = TOKEN_ROLES
+    class_buckets: int = CLASS_HASH_BUCKETS
+
+    @property
+    def action_dim(self) -> int:   # mouse x, y, left, right, keys
+        return 4 + len(self.keys)
 
     @property
     def num_buttons(self) -> int:  # left, right, keys
         return 2 + len(self.keys)
+
+    @classmethod
+    def for_profile(cls, profile, **kw) -> 'PolicyConfig':
+        return cls(game=profile.name, keys=tuple(profile.keys), **kw)
 
 
 def _logit(p: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
@@ -56,6 +67,7 @@ class ObjectTokenPolicy(nn.Module):
         d = c.d_model
 
         self.obj_in = nn.Sequential(nn.Linear(c.object_dim, d), nn.GELU(), nn.Linear(d, d))
+        self.class_emb = nn.Embedding(c.class_buckets, d)   # per detector class (hashed)
         self.player_in = nn.Sequential(nn.Linear(c.player_dim, d), nn.GELU(), nn.Linear(d, d))
         self.action_in = nn.Sequential(nn.Linear(c.action_dim, d), nn.GELU(), nn.Linear(d, d))
         self.cls = nn.Parameter(torch.zeros(1, 1, d))
@@ -83,9 +95,10 @@ class ObjectTokenPolicy(nn.Module):
         nn.init.constant_(self.button_head.bias, -3.0)
 
     def forward(self, player: torch.Tensor, prev_action: torch.Tensor,
-                objects: torch.Tensor, mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+                objects: torch.Tensor, classes: torch.Tensor, mask: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        player [B, P], prev_action [B, A], objects [B, N, O], mask [B, N] (1 = real object)
+        player [B, P], prev_action [B, A], objects [B, N, O],
+        classes [B, N] (class-name hash, long), mask [B, N] (1 = real object)
         """
         B, N, _ = objects.shape
         c = self.cfg
@@ -94,7 +107,7 @@ class ObjectTokenPolicy(nn.Module):
         tok_cls = self.cls.expand(B, 1, -1) + types[0]
         tok_player = self.player_in(player).unsqueeze(1) + types[1]
         tok_prev = self.action_in(prev_action).unsqueeze(1) + types[2]
-        tok_obj = self.obj_in(objects) + types[3]
+        tok_obj = self.obj_in(objects) + self.class_emb(classes.long()) + types[3]
         x = torch.cat([tok_cls, tok_player, tok_prev, tok_obj], dim=1)
 
         valid = mask > 0.5
@@ -132,6 +145,7 @@ def save_policy(model: ObjectTokenPolicy, path, extra: Optional[Dict] = None):
     from ..v2.training.training_utils import atomic_torch_save
     cfg = asdict(model.cfg)
     cfg['keys'] = list(cfg['keys'])
+    cfg['roles'] = list(cfg['roles'])
     atomic_torch_save({'format': 'v3_object_token_policy', 'config': cfg,
                        'state_dict': model.state_dict(), 'extra': extra or {}}, path)
 
@@ -141,7 +155,9 @@ def load_policy(path, device: str = "cpu") -> ObjectTokenPolicy:
     if ckpt.get('format') != 'v3_object_token_policy':
         raise ValueError(f"{path} is not a V3 policy checkpoint")
     cfg_d = dict(ckpt['config'])
+    cfg_d.pop('action_dim', None)        # derived from keys
     cfg_d['keys'] = tuple(cfg_d['keys'])
+    cfg_d['roles'] = tuple(cfg_d.get('roles', TOKEN_ROLES))
     model = ObjectTokenPolicy(PolicyConfig(**cfg_d))
     model.load_state_dict(ckpt['state_dict'], strict=True)  # shapes must match exactly
     model.to(device).eval()
@@ -177,7 +193,8 @@ class PolicyRunner:
     def act(self, feats: Dict) -> Dict:
         if self._step % self.replan_every == 0 or not self._chunks:
             t = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=self.device).unsqueeze(0)
-            out = self.model(t(feats['player']), t(feats['prev_action']), t(feats['objects']), t(feats['mask']))
+            cls = torch.as_tensor(np.asarray(feats['classes']), dtype=torch.long, device=self.device).unsqueeze(0)
+            out = self.model(t(feats['player']), t(feats['prev_action']), t(feats['objects']), cls, t(feats['mask']))
             mouse = torch.sigmoid(out['mouse_logits'])[0].cpu().numpy()
             buttons = torch.sigmoid(out['button_logits'])[0].cpu().numpy()
             probs = F.softmax(out['target_logits'], dim=1)[0].cpu().numpy()

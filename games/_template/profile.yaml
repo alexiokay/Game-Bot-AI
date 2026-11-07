@@ -1,0 +1,61 @@
+# Template game profile. Copy this folder to games/<your_game>/ and edit.
+# Then:  python -m darkorbit_bot.v3.agent --game <your_game> --mode record
+#
+# What V3 needs from a game:
+#   - an object detector (YOLO .pt) that finds the things that matter on screen
+#   - a cursor-driven control scheme (top-down, RTS, ARPG, browser, 2D games)
+#   'relative' mouse-look (FPS / 3D cameras) is not supported yet.
+
+name: my_game                 # must match the folder name
+description: What this game is
+
+detector:
+  weights: models/my_game/yolo.pt   # absolute, or relative to the repo root
+  confidence: 0.3
+  # Where "our" character is when the detector doesn't see it:
+  #   center = screen centre (camera follows the player), none = unknown
+  self_fallback: center
+
+# Detector class name -> role. Rules are checked top to bottom, first match wins.
+# Patterns use fnmatch: * matches anything, ? one character. Case-sensitive.
+# Roles (the same in every game, so the policy's inputs mean the same thing):
+#   self         our own character (used for position, not an object token)
+#   enemy        things to fight
+#   loot         things to collect
+#   player       other players (neutral / unknown)
+#   ally         friendly players / units
+#   hazard       things to avoid (mines, traps, AoE)
+#   interactive  portals, NPC shops, stations, doors
+#   other        anything else worth seeing
+#   ignore       UI windows, effects, text - dropped completely
+classes:
+  - role: self
+    match: [player]
+  - role: ignore
+    match: ["ui_*", damage_text]
+  - role: enemy
+    match: ["enemy*", "monster_*"]
+  - role: loot
+    match: [coin, "item_*"]
+default_role: other           # classes no rule matches
+
+# Optional health/shield bars, read by colour. Region = [x1, y1, x2, y2] as
+# fractions of the screen; hsv = [[h, s, v] low, [h, s, v] high] (OpenCV HSV,
+# h 0-179). alt_hsv is a second colour (e.g. red when low). Remove to disable.
+hud:
+  bars:
+    hp:
+      region: [0.02, 0.95, 0.20, 0.98]
+      hsv: [[0, 100, 100], [10, 255, 255]]
+
+controls:
+  mouse: absolute             # the only supported mode for now
+  left_button: hold           # hold = button state is learned per frame; click = taps
+  right_button: click
+  # Keys the policy may press (any subset of):
+  # ctrl shift alt space tab esc 1-0 q w e r t a s d f g z x c v b j
+  keys: [space, "1", "2", "3", q, w, e, r]
+
+recording:
+  fps: 20
+  video_size: [960, 540]

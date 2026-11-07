@@ -11,6 +11,9 @@ agent uses), so inputs match runtime exactly. Labels:
   weight   x3 for takeover (DAgger) frames; optional AWR reward weighting
 
 Train/val split is by SESSION (never neighbouring frames on both sides).
+
+Sessions store raw class names and every key pressed, so building them with
+the CURRENT game profile applies profile edits (roles, keys) retroactively.
 """
 
 from dataclasses import dataclass
@@ -22,7 +25,8 @@ import torch
 from torch.utils.data import Dataset
 
 from .features import FeatureBuilder, action_vector
-from .schema import (CHUNK, MAX_OBJECTS, ACTION_DIM, LEARN_FROM, TAKEOVER,
+from .profile import GameProfile
+from .schema import (CHUNK, MAX_OBJECTS, LEARN_FROM, TAKEOVER,
                      TARGET_CLICK_WINDOW_S, TARGET_MAX_DIST, TAKEOVER_WEIGHT)
 from .session_io import SessionReader
 
@@ -35,6 +39,7 @@ class SessionArrays:
     player: np.ndarray       # [T, P]
     prev_action: np.ndarray  # [T, A]
     objects: np.ndarray      # [T, N, O]
+    classes: np.ndarray      # [T, N]      class-name hash
     mask: np.ndarray         # [T, N]
     actions: np.ndarray      # [T, C, A]   future inputs
     action_mask: np.ndarray  # [T, C]      which future steps are valid labels
@@ -59,27 +64,29 @@ def _frame_reward(rec: Dict, prev: Optional[Dict]) -> float:
     return r
 
 
-def build_session(session_dir) -> SessionArrays:
+def build_session(session_dir, profile: GameProfile) -> SessionArrays:
     reader = SessionReader(session_dir)
     records = reader.read_all()
     T, C, N = len(records), CHUNK, MAX_OBJECTS
-    fb = FeatureBuilder()
+    keys = tuple(profile.keys)
+    A = 4 + len(keys)
+    fb = FeatureBuilder(profile)
 
-    player, prev_action, objects, mask, track_ids = [], [], [], [], []
+    player, prev_action, objects, classes, mask, track_ids = [], [], [], [], [], []
     for rec in records:
         f = fb.step(rec)
         player.append(f['player']); prev_action.append(f['prev_action'])
-        objects.append(f['objects']); mask.append(f['mask'])
+        objects.append(f['objects']); classes.append(f['classes']); mask.append(f['mask'])
         track_ids.append([o.track_id for o in f['tracks']])
 
     t = np.array([float(r.get('t', 0.0)) for r in records], dtype=np.float64)
     ctrl = [r.get('controller') for r in records]
     human = np.array([c in LEARN_FROM for c in ctrl], dtype=bool)
     inputs = [r.get('input') or {} for r in records]
-    act = np.stack([action_vector(i) for i in inputs]) if T else np.zeros((0, ACTION_DIM), np.float32)
+    act = np.stack([action_vector(i, keys) for i in inputs]) if T else np.zeros((0, A), np.float32)
 
     # Future action chunks (only through contiguous human frames)
-    actions = np.zeros((T, C, ACTION_DIM), dtype=np.float32)
+    actions = np.zeros((T, C, A), dtype=np.float32)
     action_mask = np.zeros((T, C), dtype=np.float32)
     for i in range(T):
         if not human[i]:
@@ -127,8 +134,10 @@ def build_session(session_dir) -> SessionArrays:
     from .schema import PLAYER_DIM, OBJECT_DIM
     return SessionArrays(
         session_id=reader.session_id,
-        player=stack(player, (PLAYER_DIM,)), prev_action=stack(prev_action, (ACTION_DIM,)),
-        objects=stack(objects, (N, OBJECT_DIM)), mask=stack(mask, (N,)),
+        player=stack(player, (PLAYER_DIM,)), prev_action=stack(prev_action, (A,)),
+        objects=stack(objects, (N, OBJECT_DIM)),
+        classes=np.stack(classes).astype(np.int64) if classes else np.zeros((0, N), np.int64),
+        mask=stack(mask, (N,)),
         actions=actions, action_mask=action_mask, target=target, weight=weight,
         sample_ok=sample_ok, t=t, reward=reward)
 
@@ -198,7 +207,7 @@ class ChunkDataset(Dataset):
         f = lambda a: torch.from_numpy(np.ascontiguousarray(a))
         return {
             'player': f(s.player[i]), 'prev_action': f(s.prev_action[i]),
-            'objects': f(s.objects[i]), 'mask': f(s.mask[i]),
+            'objects': f(s.objects[i]), 'classes': f(s.classes[i]), 'mask': f(s.mask[i]),
             'actions': f(s.actions[i]), 'action_mask': f(s.action_mask[i]),
             'target': torch.tensor(s.target[i]), 'weight': torch.tensor(s.weight[i]),
         }

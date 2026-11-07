@@ -1,9 +1,9 @@
 """
 Train the V3 ObjectTokenPolicy from recorded sessions.
 
-    python -m darkorbit_bot.v3.train                       # all sessions, defaults
-    python -m darkorbit_bot.v3.train --epochs 40 --awr     # reward-weighted
-    python -m darkorbit_bot.v3.train --init models/v3/policy.pt   # continue training
+    python -m darkorbit_bot.v3.train                         # darkorbit, all sessions
+    python -m darkorbit_bot.v3.train --game my_game --awr    # another game, reward-weighted
+    python -m darkorbit_bot.v3.train --init models/v3/darkorbit/policy.pt   # continue training
 
 Validation is split by session (see dataset.split_sessions). The best
 validation epoch is saved atomically to --out.
@@ -21,8 +21,9 @@ from torch.utils.data import DataLoader
 
 from .dataset import build_session, apply_awr, split_sessions, ChunkDataset
 from .model import ObjectTokenPolicy, PolicyConfig, save_policy, load_policy
-from .schema import SESSIONS_DIR, DEFAULT_POLICY_PATH, MAX_OBJECTS
-from .session_io import list_sessions
+from .profile import load_profile, DEFAULT_GAME
+from .schema import MAX_OBJECTS, sessions_dir, default_policy_path
+from .session_io import list_sessions, SessionReader
 
 NONE_TARGET_WEIGHT = 0.3   # most frames have no upcoming click
 
@@ -44,7 +45,7 @@ def button_pos_weight(sessions, parts, num_buttons: int, max_weight: float = 1.0
 
 def compute_loss(model, batch, pos_weight, device):
     b = {k: v.to(device) for k, v in batch.items()}
-    out = model(b['player'], b['prev_action'], b['objects'], b['mask'])
+    out = model(b['player'], b['prev_action'], b['objects'], b['classes'], b['mask'])
     w = b['weight']                                  # [B]
     am = b['action_mask']                            # [B, C]
     steps = am.sum(dim=1).clamp(min=1.0)
@@ -108,8 +109,9 @@ def run_epoch(model, loader, pos_weight, device, optimizer=None, scheduler=None)
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Train the V3 single policy")
-    ap.add_argument('--sessions-dir', default=str(SESSIONS_DIR))
-    ap.add_argument('--out', default=str(DEFAULT_POLICY_PATH))
+    ap.add_argument('--game', default=DEFAULT_GAME, help='game profile name (games/<name>/profile.yaml) or path')
+    ap.add_argument('--sessions-dir', default=None, help='default: darkorbit_bot/data/v3_sessions/<game>')
+    ap.add_argument('--out', default=None, help='default: models/v3/<game>/policy.pt')
     ap.add_argument('--init', default=None, help='continue from this V3 checkpoint')
     ap.add_argument('--epochs', type=int, default=30)
     ap.add_argument('--batch-size', type=int, default=256)
@@ -123,20 +125,29 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     device = ('cuda' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device
-    paths = list_sessions(Path(args.sessions_dir))
+    profile = load_profile(args.game)
+    sess_dir = Path(args.sessions_dir) if args.sessions_dir else sessions_dir(profile.name)
+    out_path = Path(args.out) if args.out else default_policy_path(profile.name)
+    paths = list_sessions(sess_dir)
     if not paths:
-        raise SystemExit(f"No sessions in {args.sessions_dir}. Record some play first "
-                         f"(python -m darkorbit_bot.v3.agent --mode record).")
+        raise SystemExit(f"No sessions in {sess_dir}. Record some play first "
+                         f"(python -m darkorbit_bot.v3.agent --game {profile.name} --mode record).")
 
-    print(f"[V3-TRAIN] Building {len(paths)} session(s)...")
+    print(f"[V3-TRAIN] Game '{profile.name}' ({len(profile.keys)} keys) | building {len(paths)} session(s)...")
     sessions = []
     for p in paths:
-        s = build_session(p)
+        g = SessionReader(p).game
+        if g and g != profile.name:
+            print(f"   skipping {p.name}: recorded for game '{g}'")
+            continue
+        s = build_session(p, profile)
         if args.awr:
             apply_awr(s)
         print(f"   {s.session_id}: {len(s.t)} frames, {int(s.sample_ok.sum())} samples, "
               f"{int((s.target < MAX_OBJECTS).sum())} with a click target")
         sessions.append(s)
+    if not sessions:
+        raise SystemExit(f"No sessions for game '{profile.name}' in {sess_dir}.")
 
     train_parts, val_parts, split_info = split_sessions(sessions, args.val_frac)
     train_ds, val_ds = ChunkDataset(sessions, train_parts), ChunkDataset(sessions, val_parts)
@@ -144,7 +155,14 @@ def main(argv=None):
     if len(train_ds) == 0:
         raise SystemExit("No training samples (need frames where you played).")
 
-    model = load_policy(args.init, device) if args.init else ObjectTokenPolicy(PolicyConfig()).to(device)
+    if args.init:
+        model = load_policy(args.init, device)
+        if model.cfg.game and model.cfg.game != profile.name:
+            raise SystemExit(f"--init policy was trained for '{model.cfg.game}', not '{profile.name}'")
+        if tuple(model.cfg.keys) != tuple(profile.keys):
+            raise SystemExit("--init policy has a different key list than the profile; train from scratch")
+    else:
+        model = ObjectTokenPolicy(PolicyConfig.for_profile(profile)).to(device)
     pos_weight = button_pos_weight(sessions, train_parts, model.cfg.num_buttons, args.button_pos_weight_max)
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False)
     val_dl = DataLoader(val_ds, batch_size=args.batch_size) if len(val_ds) else None
@@ -176,11 +194,12 @@ def main(argv=None):
                 break
 
     model.load_state_dict(best_state)
-    save_policy(model, args.out, extra={
+    save_policy(model, out_path, extra={
         'trained': time.strftime('%Y-%m-%d %H:%M:%S'), 'best_epoch': best_epoch, 'best_val_loss': best,
+        'game': profile.name, 'profile': profile.raw,
         'sessions': [s.session_id for s in sessions], 'split': split_info, 'awr': args.awr,
         'history': history})
-    print(f"[V3-TRAIN] Saved best epoch {best_epoch} (val {best:.4f}) to {args.out}")
+    print(f"[V3-TRAIN] Saved best epoch {best_epoch} (val {best:.4f}) to {out_path}")
 
 
 if __name__ == '__main__':

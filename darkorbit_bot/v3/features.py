@@ -1,23 +1,23 @@
 """
-The ONE place V3 model inputs are built.
+The ONE place V3 model inputs are built - for any game, via its GameProfile.
 
 Both the live agent and the training dataset feed per-frame records (the same
-dicts that are written to frames.jsonl) through FeatureBuilder.step(), in time
-order. That guarantees training inputs and runtime inputs are identical -
-including the tracker, the object order and the previous-action token.
+dicts written to frames.jsonl) through FeatureBuilder.step(), in time order.
+That guarantees training inputs and runtime inputs are identical - including
+the tracker, the object order and the previous-action token.
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
 from ..v2.perception.tracker import ObjectTracker
-from .schema import (MAX_OBJECTS, OBJECT_DIM, PLAYER_DIM, KEYS, NUM_KEYS,
-                     ACTION_DIM)
+from .profile import GameProfile, TOKEN_ROLES, class_hash
+from .schema import (MAX_OBJECTS, OBJECT_DIM, OBJECT_BASE_DIM, PLAYER_DIM, OBJ_VELOCITY_SCALE,
+                     TRACK_MATCH_IOU, TRACK_MAX_MISSED)
 
-# Our own ship (excluded from object tokens; other players' ships stay)
-OWN_SHIP_CLASSES = ('Player', 'PlayerShip', 'player_ship')
-KEY_INDEX = {k: i for i, k in enumerate(KEYS)}
+assert OBJECT_DIM == OBJECT_BASE_DIM + len(TOKEN_ROLES)
+ROLE_INDEX = {r: i for i, r in enumerate(TOKEN_ROLES)}
 
 
 # --------------------------------------------------------------------------
@@ -25,7 +25,9 @@ KEY_INDEX = {k: i for i, k in enumerate(KEYS)}
 # --------------------------------------------------------------------------
 
 def detection_to_raw(det) -> Dict:
-    """YOLO Detection (detection/detector.py) -> compact JSON-able dict."""
+    """YOLO Detection (detection/detector.py) -> compact JSON-able dict.
+    Stores the raw class name; roles are applied later from the profile, so a
+    profile edit never requires re-recording."""
     return {
         'c': det.class_name,
         'p': round(float(det.confidence), 4),
@@ -44,12 +46,12 @@ def raw_to_tracker_input(raw: Dict) -> Dict:
     }
 
 
-def player_position(raw_dets: List[Dict]):
-    """Own ship position from YOLO; (0.5, 0.5, False) when not detected
-    (in DarkOrbit the map scrolls around the ship, so centre is a good guess)."""
+def player_position(raw_dets: List[Dict], profile: GameProfile):
+    """Our character's position from the detector (role 'self'). When not seen:
+    screen centre (profile self_fallback 'center') or (0.5, 0.5) marked unseen."""
     best = None
     for d in raw_dets:
-        if d['c'] in OWN_SHIP_CLASSES and (best is None or d['p'] > best['p']):
+        if profile.role_of(d['c']) == 'self' and (best is None or d['p'] > best['p']):
             best = d
     if best is None:
         return 0.5, 0.5, False
@@ -57,10 +59,10 @@ def player_position(raw_dets: List[Dict]):
     return (x1 + x2) / 2, (y1 + y2) / 2, True
 
 
-def action_vector(inp: Optional[Dict]) -> np.ndarray:
-    """Input dict {mx, my, lmb, rmb, keys:[...]} -> [ACTION_DIM] float vector
-    (mouse x, mouse y, left, right, one value per key)."""
-    v = np.zeros(ACTION_DIM, dtype=np.float32)
+def action_vector(inp: Optional[Dict], keys: Sequence[str]) -> np.ndarray:
+    """Input dict {mx, my, lmb, rmb, keys:[...]} -> [4 + len(keys)] float vector
+    (mouse x, mouse y, left, right, one value per profile key)."""
+    v = np.zeros(4 + len(keys), dtype=np.float32)
     if not inp:
         v[0] = v[1] = 0.5
         return v
@@ -68,19 +70,40 @@ def action_vector(inp: Optional[Dict]) -> np.ndarray:
     v[1] = float(np.clip(inp.get('my', 0.5), 0.0, 1.0))
     v[2] = 1.0 if inp.get('lmb') else 0.0
     v[3] = 1.0 if inp.get('rmb') else 0.0
-    for k in inp.get('keys', ()):
-        i = KEY_INDEX.get(k)
-        if i is not None:
+    pressed = set(inp.get('keys', ()))
+    for i, k in enumerate(keys):
+        if k in pressed:
             v[4 + i] = 1.0
     return v
 
 
-def acted_input(record: Dict) -> Optional[Dict]:
+def acted_input(record: Optional[Dict]) -> Optional[Dict]:
     """The input that actually happened this frame: the bot's action on bot
     frames, the human's input otherwise."""
+    if not record:
+        return None
     if record.get('controller') == 'bot' and record.get('bot_action'):
         return record['bot_action']
     return record.get('input')
+
+
+def object_features(o, role: str, px: float, py: float) -> np.ndarray:
+    """[OBJECT_DIM] token for one tracked object, relative to our character.
+    [0-3] x, y, distance, angle   [4-7] vx, vy, speed, heading
+    [8-11] w, h, confidence, age  [12-15] hits, time since update, tracked, lost
+    [16-22] role one-hot (TOKEN_ROLES)"""
+    dx, dy = o.x - px, o.y - py
+    f = np.zeros(OBJECT_DIM, dtype=np.float32)
+    f[0:16] = (
+        o.x, o.y, np.hypot(dx, dy), np.arctan2(dy, dx) / np.pi,
+        o.vx * OBJ_VELOCITY_SCALE, o.vy * OBJ_VELOCITY_SCALE,
+        o.get_speed() * OBJ_VELOCITY_SCALE, o.get_heading() / np.pi,
+        o.width, o.height, o.confidence, min(o.age / 100, 1.0),
+        min(o.hits / 50, 1.0), min(o.time_since_update / 10, 1.0),
+        1.0 if o.state == "tracked" else 0.0, 1.0 if o.state == "lost" else 0.0,
+    )
+    f[OBJECT_BASE_DIM + ROLE_INDEX.get(role, ROLE_INDEX['other'])] = 1.0
+    return f
 
 
 # --------------------------------------------------------------------------
@@ -90,8 +113,10 @@ def acted_input(record: Dict) -> Optional[Dict]:
 class FeatureBuilder:
     """Stateful per-session feature builder. Call step() once per frame, in order."""
 
-    def __init__(self):
-        self.tracker = ObjectTracker()
+    def __init__(self, profile: GameProfile):
+        self.profile = profile
+        self.keys = tuple(profile.keys)
+        self.tracker = ObjectTracker(match_thresh=TRACK_MATCH_IOU)
         self.reset()
 
     def reset(self):
@@ -109,28 +134,33 @@ class FeatureBuilder:
             t, dets, hud {hp, shield, hp_conf}, controller, input / bot_action
         Returns dict with numpy arrays:
             player [PLAYER_DIM], objects [MAX_OBJECTS, OBJECT_DIM],
-            mask [MAX_OBJECTS], prev_action [ACTION_DIM],
-            tracks (list of TrackedObject in token order), player_xy
+            classes [MAX_OBJECTS] (class-name hash), mask [MAX_OBJECTS],
+            prev_action [4 + K], tracks (TrackedObject list in token order), player_xy
         """
+        prof = self.profile
         t = float(record.get('t', 0.0))
         raw_dets = record.get('dets', [])
-        px, py, seen = player_position(raw_dets)
+        px, py, seen = player_position(raw_dets, prof)
 
-        # Track every non-own-ship object; the tracker is deterministic, so
-        # replaying stored detections reproduces the live tracks exactly
+        # Track every object that is neither us nor ignored; the tracker is
+        # deterministic, so replaying stored detections reproduces live tracks
         tracker_in = [raw_to_tracker_input(d) for d in raw_dets
-                      if d['c'] not in OWN_SHIP_CLASSES]
+                      if prof.role_of(d['c']) not in ('self', 'ignore')]
         tracks = self.tracker.update(tracker_in)
+        # Only objects seen recently (no long-lost predicted ghosts)
+        tracks = [o for o in tracks if o.time_since_update <= TRACK_MAX_MISSED]
         tracks = sorted(tracks, key=lambda o: (o.x - px) ** 2 + (o.y - py) ** 2)[:MAX_OBJECTS]
 
         objects = np.zeros((MAX_OBJECTS, OBJECT_DIM), dtype=np.float32)
+        classes = np.zeros(MAX_OBJECTS, dtype=np.int64)
         mask = np.zeros(MAX_OBJECTS, dtype=np.float32)
         for i, o in enumerate(tracks):
-            objects[i] = o.to_feature_vector(px, py)
+            objects[i] = object_features(o, prof.role_of(o.class_name), px, py)
+            classes[i] = class_hash(o.class_name)
             mask[i] = 1.0
 
         # Player token
-        dt = max(1e-3, t - self._prev_t) if self._prev_t is not None else 0.05
+        dt = max(1e-3, t - self._prev_t) if self._prev_t is not None else 1.0 / max(1, prof.fps)
         if self._prev_xy is not None:
             vx = (px - self._prev_xy[0]) / dt
             vy = (py - self._prev_xy[1]) / dt
@@ -145,7 +175,7 @@ class FeatureBuilder:
         if hp_delta < -0.002 or shield_delta < -0.002:
             self._last_damage_t = t
         since_damage = (t - self._last_damage_t) if self._last_damage_t is not None else 10.0
-        n_enemies = float(objects[:, 16].sum())  # feature 16 = is_enemy
+        n_enemies = float(objects[:, OBJECT_BASE_DIM + ROLE_INDEX['enemy']].sum())
 
         player = np.array([
             px, py,
@@ -153,7 +183,7 @@ class FeatureBuilder:
             hp, shield,
             np.clip(hp_delta * 10, -1, 1), np.clip(shield_delta * 10, -1, 1),
             hp_known,
-            1.0 if seen else 0.0,
+            1.0 if seen else (0.5 if prof.self_fallback == 'center' else 0.0),
             min(since_damage / 10.0, 1.0),
             min(n_enemies / 5.0, 1.0),
         ], dtype=np.float32)
@@ -163,16 +193,11 @@ class FeatureBuilder:
         # from the previous record NOW (not when it was stepped), because the
         # live agent attaches 'bot_action' to a record after its features are
         # built; a replayed record already has it - so both see the same value.
-        prev_action = (action_vector(acted_input(self._prev_record))
-                       if self._prev_record is not None else action_vector(None))
+        prev_action = action_vector(acted_input(self._prev_record), self.keys)
 
         out = {
-            'player': player,
-            'objects': objects,
-            'mask': mask,
-            'prev_action': prev_action,
-            'tracks': tracks,
-            'player_xy': (px, py),
+            'player': player, 'objects': objects, 'classes': classes, 'mask': mask,
+            'prev_action': prev_action, 'tracks': tracks, 'player_xy': (px, py),
         }
 
         # Update history AFTER building this frame's inputs

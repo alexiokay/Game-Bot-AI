@@ -1,10 +1,10 @@
 """
 Raw session recording: downscaled video + one JSON line per frame + meta.
 
-    <SESSIONS_DIR>/<session_id>/
+    <SESSIONS_DIR>/<game>/<session_id>/
         video.mp4      960x540 at ~20 fps (frame_idx in each record points here)
         frames.jsonl   one record per frame (detections, HUD, inputs, controller)
-        meta.json      monitor, fps, YOLO model, format version, counts
+        meta.json      game + full profile copy, monitor, fps, YOLO model, counts
 
 Files are written as *.tmp and renamed on close(). If the process dies,
 frames.jsonl.tmp still holds every complete line and SessionReader reads it.
@@ -41,16 +41,21 @@ def file_sha1(path: str, limit_bytes: int = 64 * 1024 * 1024) -> Optional[str]:
 
 class SessionWriter:
     def __init__(self, meta: Dict, root: Path = SESSIONS_DIR, session_id: Optional[str] = None,
-                 record_video: bool = True, fps: int = RECORD_FPS):
+                 record_video: bool = True, fps: int = RECORD_FPS, video_size=VIDEO_SIZE, profile=None):
         self.session_id = session_id or new_session_id()
         self.dir = Path(root) / self.session_id
         self.dir.mkdir(parents=True, exist_ok=True)
         self.meta = dict(meta)
+        self.video_size = tuple(int(v) for v in video_size)
+        if profile is not None:
+            # Full copy: the session stays usable even if the profile file changes
+            self.meta['game'] = profile.name
+            self.meta['profile'] = profile.raw
         self.meta.update({
             'format_version': SESSION_FORMAT_VERSION,
             'session_id': self.session_id,
             'fps': fps,
-            'video_size': list(VIDEO_SIZE),
+            'video_size': list(self.video_size),
             'started': time.time(),
         })
         self._frames_tmp = self.dir / "frames.jsonl.tmp"
@@ -87,9 +92,9 @@ class SessionWriter:
                     break
                 if writer is None:
                     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    writer = cv2.VideoWriter(str(self._video_tmp), fourcc, fps, VIDEO_SIZE)
-                if frame.shape[1] != VIDEO_SIZE[0] or frame.shape[0] != VIDEO_SIZE[1]:
-                    frame = cv2.resize(frame, VIDEO_SIZE, interpolation=cv2.INTER_AREA)
+                    writer = cv2.VideoWriter(str(self._video_tmp), fourcc, fps, self.video_size)
+                if frame.shape[1] != self.video_size[0] or frame.shape[0] != self.video_size[1]:
+                    frame = cv2.resize(frame, self.video_size, interpolation=cv2.INTER_AREA)
                 writer.write(np.ascontiguousarray(frame[:, :, :3]))
         finally:
             if writer is not None:
@@ -168,6 +173,18 @@ class SessionReader:
 
     def read_all(self) -> List[Dict]:
         return list(self.records())
+
+    @property
+    def game(self) -> Optional[str]:
+        return self.meta.get('game')
+
+    def profile(self):
+        """The profile the session was recorded with (its stored copy); falls
+        back to the current file for sessions without one."""
+        from .profile import profile_from_dict, load_profile, DEFAULT_GAME
+        if self.meta.get('profile'):
+            return profile_from_dict(self.meta['profile'], source=f"{self.dir}/meta.json")
+        return load_profile(self.meta.get('game') or DEFAULT_GAME)
 
     def video_frame(self, frame_idx: int) -> Optional[np.ndarray]:
         """Random-access one stored frame (for re-running a detector later)."""
