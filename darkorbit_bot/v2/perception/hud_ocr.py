@@ -138,6 +138,12 @@ class HUDReader:
         self._smoothed_hp = 1.0
         self._smoothed_shield = 1.0
 
+        # Whether each bar has been clearly seen this session. A near-empty
+        # reading only counts as "low/empty" once the bar is known to be in its
+        # region; before that it means "bar not found" (unknown).
+        self._hp_bar_seen = False
+        self._shield_bar_seen = False
+
         # Caching
         self._last_values: Optional[HUDValues] = None
         self._last_read_time = 0
@@ -197,9 +203,15 @@ class HUDReader:
                 return self._last_values
 
         values = HUDValues()
+        # Default to the last known values (confidence 0), NOT to 100%: a missed
+        # or empty bar used to read as full HP, so damage and death never showed.
+        values.hp = self._smoothed_hp
+        values.shield = self._smoothed_shield
 
         # Method 1: Color-based bar detection (fast)
         hp_color, shield_color = self._detect_bars_by_color(frame)
+        hp_color = self._accept_bar_reading(hp_color, 'hp')
+        shield_color = self._accept_bar_reading(shield_color, 'shield')
 
         if hp_color is not None:
             values.hp = hp_color
@@ -242,6 +254,26 @@ class HUDReader:
         self._last_read_time = current_time
 
         return values
+
+    # Fill at or above this means the bar is clearly visible in its region
+    BAR_PRESENT_RATIO = 0.05
+
+    def _accept_bar_reading(self, ratio: Optional[float], which: str) -> Optional[float]:
+        """
+        Turn a raw bar-fill measurement into a value or None (= unknown).
+
+        - clearly visible (>= BAR_PRESENT_RATIO): use it, remember the bar exists
+        - almost no bar colour: if the bar was seen earlier this session it has
+          really drained -> return the (near-)zero value; otherwise the region
+          probably doesn't contain the bar -> unknown
+        """
+        if ratio is None:
+            return None
+        seen_attr = f'_{which}_bar_seen'
+        if ratio >= self.BAR_PRESENT_RATIO:
+            setattr(self, seen_attr, True)
+            return ratio
+        return float(ratio) if getattr(self, seen_attr, False) else None
 
     def _get_region_pixels(self, frame: np.ndarray,
                            region: Tuple[float, float, float, float]) -> np.ndarray:
@@ -354,7 +386,10 @@ class HUDReader:
         elif pixel_ratio > 0.1:
             return pixel_ratio
 
-        return None
+        # (Nearly) no bar colour. Return the measurement instead of None so an
+        # empty or almost-empty bar can read as low HP; _accept_bar_reading
+        # decides whether that means "empty" or "bar not found".
+        return float(fill_ratio)
 
     def _read_ocr(self, frame: np.ndarray) -> Dict:
         """
@@ -595,6 +630,8 @@ class HUDReader:
         """Reset smoothed values and cache."""
         self._smoothed_hp = 1.0
         self._smoothed_shield = 1.0
+        self._hp_bar_seen = False
+        self._shield_bar_seen = False
         self._last_values = None
         self._last_read_time = 0
 

@@ -49,6 +49,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from ..models.executor import create_executor, save_executor, Executor, ExecutorV2
+from ..models.unified import build_target_info  # same target_info layout as inference
 from ..config import ExecutorConfig, TrainingConfig, KEYBOARD_KEYS, NUM_KEYBOARD_KEYS, KEYBOARD_KEY_TO_IDX
 
 
@@ -68,6 +69,9 @@ class ExecutorDataset(Dataset):
         self.data_dir = Path(data_dir)
         self.sequence_length = sequence_length
         self.samples: List[Dict] = []
+        # Frames per sample for ExecutorV2 (set by train_executor once the model
+        # is known). Stacks never cross recording-file boundaries.
+        self.frame_stack_size = 1
 
         self._load_recordings()
 
@@ -86,7 +90,8 @@ class ExecutorDataset(Dataset):
 
         print(f"[Executor] Found {len(recording_files)} recording files")
 
-        for file_path in recording_files:
+        for file_idx, file_path in enumerate(recording_files):
+            start = len(self.samples)
             try:
                 if file_path.suffix == '.npz':
                     self._load_npz(file_path)
@@ -96,6 +101,9 @@ class ExecutorDataset(Dataset):
                     self._load_pkl(file_path)
             except Exception as e:
                 print(f"   Warning: Could not load {file_path}: {e}")
+            # Tag samples with their file so frame stacks stay inside one recording
+            for s in self.samples[start:]:
+                s['_file_idx'] = file_idx
 
         print(f"[Executor] Loaded {len(self.samples)} training samples")
 
@@ -136,16 +144,11 @@ class ExecutorDataset(Dataset):
             # Parse action
             action = self._parse_action(actions[i])
 
-            # Extract target position from action (human aimed at this position)
-            target_x = action[0]  # mouse_x is where human aimed
-            target_y = action[1]  # mouse_y is where human aimed
-
-            # Build target_info: [target_x, target_y, ...32-dim embedding...]
-            target_embed = target_infos[i][:32] if len(target_infos[i]) >= 32 else np.pad(target_infos[i], (0, 32 - len(target_infos[i])))
-            target_info_full = np.concatenate([
-                np.array([target_x, target_y], dtype=np.float32),
-                target_embed.astype(np.float32)
-            ])
+            # No object data in this format. Use the same "no target" input the
+            # bot sees at inference (screen centre). Never put the human's mouse
+            # position in the input: it IS the label, so the model would just
+            # learn to copy it and fail at runtime.
+            target_info_full = build_target_info(None, None, -1)
 
             self.samples.append({
                 'state': state_compact.astype(np.float32),
@@ -202,13 +205,9 @@ class ExecutorDataset(Dataset):
                     0.0  # Ability (not in recordings)
                 ], dtype=np.float32)
 
-                # Build target_info: [target_x, target_y, ...32-dim embedding...]
-                # WARNING: This is the old "cheating" format - mouse position = target position
-                # V2 format with objects is preferred
-                target_info = np.concatenate([
-                    np.array([mouse_x, mouse_y], dtype=np.float32),
-                    target_embed
-                ])
+                # No object data in this format: "no target" input, as at inference.
+                # (The old format put the mouse position = the label here.)
+                target_info = build_target_info(None, None, -1)
 
                 self.samples.append({
                     'state': state,
@@ -244,11 +243,9 @@ class ExecutorDataset(Dataset):
                 0.0  # Ability (not in recordings)
             ], dtype=np.float32)
 
-            # Build target_info: [target_x, target_y, ...32-dim embedding...]
-            target_info = np.concatenate([
-                np.array([mouse_x, mouse_y], dtype=np.float32),
-                target_embed
-            ])
+            # No object data in this format: "no target" input, as at inference.
+            # (The old format put the mouse position = the label here.)
+            target_info = build_target_info(None, None, -1)
 
             self.samples.append({
                 'state': state,
@@ -488,55 +485,11 @@ class ExecutorDataset(Dataset):
             target_obj, target_idx = self._find_target_object(objects, mask, mouse_x, mouse_y)
             
             if target_obj is not None:
-                # Build target_info from OBJECT features (not mouse position!)
-                # Object feature layout from TrackedObject.to_feature_vector (20-dim):
-                # [0-3]:   x, y, distance_to_player, angle_to_player (position)
-                # [4-7]:   vx, vy, speed, heading (velocity)
-                # [8-11]:  width, height, confidence, age_normalized (bbox)
-                # [12-15]: hits_norm, time_since_update_norm, is_tracked, is_lost (tracking)
-                # [16-19]: is_enemy, is_loot, is_player, is_other (class)
+                # target_info from the object the human aimed at, built exactly
+                # like inference does. (Previously [10-11] held mouse - object,
+                # i.e. the answer, which is always 0 at inference.)
+                target_info = build_target_info(objects, mask, target_idx)
 
-                obj_x = target_obj[0]
-                obj_y = target_obj[1]
-                obj_vx = target_obj[4] if len(target_obj) > 4 else 0.0
-                obj_vy = target_obj[5] if len(target_obj) > 5 else 0.0
-                obj_speed = target_obj[6] if len(target_obj) > 6 else 0.0
-                obj_width = target_obj[8] if len(target_obj) > 8 else 0.05
-                obj_height = target_obj[9] if len(target_obj) > 9 else 0.05
-                obj_confidence = target_obj[10] if len(target_obj) > 10 else 1.0
-                obj_is_enemy = target_obj[16] if len(target_obj) > 16 else 0.0  # FIXED: was [14]
-                obj_is_loot = target_obj[17] if len(target_obj) > 17 else 0.0   # FIXED: was [15]
-                
-                # Build 34-dim target_info:
-                # [0-1]: Object x, y (where the target IS)
-                # [2-3]: Object velocity x, y (which way it's moving)
-                # [4]: Object speed
-                # [5-6]: Object size (width, height)
-                # [7]: Object confidence
-                # [8]: Is enemy
-                # [9]: Is loot
-                # [10-11]: Distance from player (mouse_x - obj_x, mouse_y - obj_y)
-                # [12-31]: Padding/additional features (20 dims)
-                # [32-33]: Reserved
-                
-                target_info = np.zeros(34, dtype=np.float32)
-                target_info[0] = obj_x
-                target_info[1] = obj_y
-                target_info[2] = obj_vx
-                target_info[3] = obj_vy
-                target_info[4] = obj_speed
-                target_info[5] = obj_width
-                target_info[6] = obj_height
-                target_info[7] = obj_confidence
-                target_info[8] = obj_is_enemy
-                target_info[9] = obj_is_loot
-                target_info[10] = mouse_x - obj_x  # Relative aim offset X
-                target_info[11] = mouse_y - obj_y  # Relative aim offset Y
-                # Copy remaining object features as context
-                for j in range(min(20, len(target_obj))):
-                    if 12 + j < 32:
-                        target_info[12 + j] = target_obj[j]
-                
                 # Synthetic goal (will be learned from strategist later)
                 goal = np.random.randn(64).astype(np.float32) * 0.1
                 
@@ -548,12 +501,10 @@ class ExecutorDataset(Dataset):
                 })
                 samples_added += 1
             else:
-                # No valid object found - still train on this frame
-                # Use mouse position as a fallback (center of attention)
-                target_info = np.zeros(34, dtype=np.float32)
-                target_info[0] = mouse_x  # Fallback to mouse position
-                target_info[1] = mouse_y
-                # Other features stay at 0
+                # No object near the cursor - still train on this frame, with the
+                # same "no target" input the bot gets at inference (screen centre),
+                # not the mouse position (that would leak the label)
+                target_info = build_target_info(None, None, -1)
                 
                 goal = np.random.randn(64).astype(np.float32) * 0.1
                 
@@ -612,9 +563,24 @@ class ExecutorDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _stacked_state(self, idx: int) -> np.ndarray:
+        """Previous frame_stack_size compact states (oldest -> newest) from the same
+        recording, padded with the oldest available frame (matches inference)."""
+        n = self.frame_stack_size
+        file_idx = self.samples[idx].get('_file_idx')
+        frames = []
+        for i in range(idx - n + 1, idx + 1):
+            if i >= 0 and self.samples[i].get('_file_idx') == file_idx:
+                frames.append(self.samples[i]['state'][:64])
+        frames = [frames[0]] * (n - len(frames)) + frames
+        return np.concatenate(frames, axis=0).astype(np.float32)
+
     def __getitem__(self, idx: int) -> Tuple:
         sample = self.samples[idx]
-        state = torch.from_numpy(sample['state'])
+        if self.frame_stack_size > 1:
+            state = torch.from_numpy(self._stacked_state(idx))
+        else:
+            state = torch.from_numpy(sample['state'])
         goal = torch.from_numpy(sample['goal'])
         target_info = torch.from_numpy(sample['target_info'])
         action = torch.from_numpy(sample['action'])
@@ -1049,6 +1015,12 @@ def train_executor(
     is_v2 = isinstance(model, ExecutorV2)
     print(f"   Model: {model.__class__.__name__} | Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
+    # ExecutorV2 sees the last N compact states at inference; give it the same
+    # stack in training (train/val subsets share this dataset object)
+    if is_v2:
+        dataset.frame_stack_size = model.frame_stack_size
+        print(f"   Frame stacking: {model.frame_stack_size} frames per sample")
+
     # Loss and optimizer
     if is_v2:
         criterion = ExecutorLossV2(
@@ -1199,7 +1171,7 @@ def train_executor(
         # Save best
         if val_metrics['total_loss'] < best_val_loss:
             best_val_loss = val_metrics['total_loss']
-            best_model_state = model.state_dict().copy()
+            best_model_state = {k: v.detach().clone() for k, v in model.state_dict().items()}  # real copy, not aliases of live weights
             print(f"   New best model! Val loss: {best_val_loss:.4f}")
 
     # Load best model

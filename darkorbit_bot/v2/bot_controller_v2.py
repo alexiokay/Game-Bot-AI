@@ -38,12 +38,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # V2 imports
+from .config import DEFAULT_YOLO_MODEL_PATH
 from .perception.tracker import ObjectTracker, TrackedObject
 from .perception.state_encoder import StateEncoderV2, StateSummarizer, PlayerState
 from .perception.vision_encoder import VisionEncoder, VisionConfig, create_vision_encoder
 from .perception.hud_ocr import HUDReader, HUDConfig, create_hud_reader, TargetHPReader
 from .perception.gui_detector import GUIDetector, MinimapDetector
-from .models.unified import HierarchicalPolicy, create_hierarchical_policy, load_hierarchical_policy
+from .models.unified import HierarchicalPolicy, create_hierarchical_policy, load_hierarchical_policy, build_target_info
 
 # V2 VLM
 from .vlm.vlm_v2 import VLM_V2
@@ -286,7 +287,7 @@ class DebugSocketServer:
 class BotConfigV2:
     """V2 Bot configuration"""
     # Detection
-    model_path: str = "F:/dev/bot/best.pt"
+    model_path: str = DEFAULT_YOLO_MODEL_PATH
     monitor: int = 1
 
     # Policy
@@ -451,6 +452,8 @@ class BotControllerV2:
             self.policy = load_hierarchical_policy(config.policy_dir, device=config.device)
             print(f"   Loaded trained policy from {config.policy_dir}")
         else:
+            if config.policy_dir:
+                print(f"   WARNING: policy dir not found: {config.policy_dir}")
             self.policy = create_hierarchical_policy(device=config.device)
             print("   Using untrained policy (demo mode)")
             
@@ -930,21 +933,55 @@ class BotControllerV2:
         # Setup hotkeys
         self._setup_hotkeys()
 
+    def _release_all_inputs(self):
+        """Make sure no key or mouse button the bot pressed stays held down."""
+        try:
+            if getattr(self, 'keyboard', None) is not None and hasattr(self.keyboard, 'release_all'):
+                self.keyboard.release_all()
+        except Exception as e:
+            print(f"   [V2] Could not release keys: {e}")
+        try:
+            if getattr(self, 'mouse', None) is not None and hasattr(self.mouse, 'release_buttons'):
+                self.mouse.release_buttons()
+        except Exception as e:
+            print(f"   [V2] Could not release mouse buttons: {e}")
+
     def stop(self):
-        """Stop the bot."""
+        """Stop the bot (safe to call more than once and from any thread;
+        cleanup runs only once)."""
+        if not hasattr(self, '_stop_lock'):
+            self._stop_lock = threading.Lock()
+        with self._stop_lock:
+            if getattr(self, '_stopped', False):
+                return
+            self._stopped = True
+
         print("\n   [STOP] Stopping bot...")
         self.running = False
+        try:
+            self._stop_impl()
+        finally:
+            # Always runs, even if a save above failed
+            self._release_all_inputs()
+            if self.shadow_trainer:
+                try:
+                    self.shadow_trainer.input_capture.release_cursor()
+                except Exception:
+                    pass
 
+    def _stop_impl(self):
         # Release mouse cursor if it was locked
         if self.shadow_trainer:
             print("   [STOP] Releasing cursor...")
             self.shadow_trainer.input_capture.release_cursor()
 
-        if self.bot_thread:
+        if self.bot_thread and self.bot_thread is not threading.current_thread():
             print("   [STOP] Waiting for bot thread to finish...")
             self.bot_thread.join(timeout=2.0)
             if self.bot_thread.is_alive():
                 print("   [STOP] WARNING: Bot thread did not finish in time!")
+        # Control thread has stopped pressing keys - release anything still held
+        self._release_all_inputs()
         if self.kb_listener:
             self.kb_listener.stop()
         # Stop mouse movement thread
@@ -973,7 +1010,7 @@ class BotControllerV2:
                 if self.checkpoint_manager:
                     score = compute_score({
                         'hit_rate': stats['hit_rate'],
-                        'position_error': -stats.get('avg_pos_error', 0.1),  # Lower is better
+                        'position_error': stats.get('avg_pos_error', 0.1),  # compute_score weights it -0.2 (lower is better)
                     })
                     self.checkpoint_manager.save(
                         model=self.policy.executor,
@@ -1042,7 +1079,7 @@ class BotControllerV2:
                 if self.checkpoint_manager:
                     score = compute_score({
                         'click_accuracy': stats['avg_click_accuracy'],
-                        'position_error': -stats['avg_pos_error'],  # Lower is better
+                        'position_error': stats['avg_pos_error'],  # compute_score weights it -0.2 (lower is better)
                     })
                     self.checkpoint_manager.save(
                         model=self.policy.executor,
@@ -1149,10 +1186,12 @@ class BotControllerV2:
 
     def _emergency_stop(self):
         print("\n[V2] EMERGENCY STOP!")
+        # Only signal here. This runs on the (daemon) hotkey-listener thread, so
+        # calling stop() from it raced with main() exiting and killed saves
+        # mid-write. main() sees running=False and runs stop() (which saves
+        # models and recordings) on the main thread before the process exits.
         self.running = False
-        # CRITICAL: Call stop() to save models and recordings!
-        # Previously this was missing, causing all training data to be lost on F3
-        self.stop()
+        self._release_all_inputs()
 
     def _toggle_debug(self):
         self.debug_mode = not self.debug_mode
@@ -1258,9 +1297,21 @@ class BotControllerV2:
         # DO NOT re-initialize here - DXCam only allows ONE instance per device
         # Re-creating causes "already created" warning and race conditions between threads
 
+        try:
+            self._control_loop_body()
+        finally:
+            # Loop ended (stop or unexpected exit): never leave keys held
+            self._release_all_inputs()
+
+    def _control_loop_body(self):
+        inputs_released = False  # released for the current pause / error streak
         while self.running:
             try:
                 if self.paused:
+                    # Paused by F1 or F2: release modifiers/buttons once
+                    if not inputs_released:
+                        self._release_all_inputs()
+                        inputs_released = True
                     time.sleep(0.1)
                     continue
 
@@ -1303,13 +1354,15 @@ class BotControllerV2:
 
                 # Store detections for heatmap thread (convert to normalized coords)
                 # This shows EXACTLY what the AI sees in the heatmap overlay
+                # Detection has normalised x_min/y_min/x_max/y_max (there are no
+                # x1/y1/x2/y2 attributes - the old getattr always gave 0 boxes)
                 h, w = frame.shape[:2]
                 self._latest_detections_for_heatmap = [
                     {
-                        'x_min': getattr(d, 'x1', 0) / w,
-                        'y_min': getattr(d, 'y1', 0) / h,
-                        'x_max': getattr(d, 'x2', 0) / w,
-                        'y_max': getattr(d, 'y2', 0) / h,
+                        'x_min': float(getattr(d, 'x_min', 0)),
+                        'y_min': float(getattr(d, 'y_min', 0)),
+                        'x_max': float(getattr(d, 'x_max', 0)),
+                        'y_max': float(getattr(d, 'y_max', 0)),
                         'confidence': getattr(d, 'confidence', 0.5),
                         'class_name': getattr(d, 'class_name', 'unknown')
                     }
@@ -1329,9 +1382,10 @@ class BotControllerV2:
                         det_list.append({
                             'class_name': getattr(det, 'class_name', 'unknown'),
                             'confidence': getattr(det, 'confidence', 0.5),
-                            'bbox': [getattr(det, 'x1', 0), getattr(det, 'y1', 0),
-                                    getattr(det, 'x2', 0) - getattr(det, 'x1', 0),
-                                    getattr(det, 'y2', 0) - getattr(det, 'y1', 0)]
+                            # Auto-labeler wants pixel [x, y, width, height]
+                            'bbox': [getattr(det, 'x_min', 0) * w, getattr(det, 'y_min', 0) * h,
+                                     (getattr(det, 'x_max', 0) - getattr(det, 'x_min', 0)) * w,
+                                     (getattr(det, 'y_max', 0) - getattr(det, 'y_min', 0)) * h]
                         })
                     self.auto_labeler.check_and_queue(frame, det_list)
 
@@ -1362,6 +1416,18 @@ class BotControllerV2:
                     # (map scrolls around the player)
                     self.player_x = 0.5
                     self.player_y = 0.5
+
+                # Put objects in the SAME order the state encoder uses (nearest to
+                # the player first; Python's sort is stable so the encoder's own sort
+                # keeps this order). The policy's target_idx indexes that order, so
+                # every later tracked_objects[target_idx] lookup (online-learner
+                # target/HP, VLM, logs, debug viewer) and the per-object roi_visual
+                # rows now refer to the same object the policy chose.
+                px, py = self.player_x, self.player_y
+                tracked_objects = sorted(
+                    tracked_objects,
+                    key=lambda o: (o.x - px) ** 2 + (o.y - py) ** 2
+                )
 
                 # Update health (prefer HUD OCR over fallback estimation)
                 if self._use_hud_ocr and self.hud_reader is not None and frame is not None:
@@ -1576,18 +1642,10 @@ class BotControllerV2:
                 # 3b. SHADOW TRAINING (Learn from human play)
                 # ═══════════════════════════════════════
                 if self.shadow_trainer:
-                    # Build target_info for shadow trainer
-                    target_info_34 = np.zeros(34, dtype=np.float32)
-                    if target_idx >= 0 and target_idx < len(state_dict['objects']):
-                        obj = state_dict['objects'][target_idx]
-                        target_info_34[0] = obj[0]  # x
-                        target_info_34[1] = obj[1]  # y
-                        for j in range(min(20, len(obj))):
-                            if 12 + j < 32:
-                                target_info_34[12 + j] = obj[j]
-                    else:
-                        target_info_34[0] = 0.5
-                        target_info_34[1] = 0.5
+                    # Build target_info for shadow trainer - identical to what the
+                    # executor gets at inference (was missing velocity/size/class)
+                    target_info_34 = build_target_info(
+                        state_dict['objects'], state_dict.get('object_mask'), target_idx)
 
                     # Record human action and train (with full hierarchical data if enabled)
                     human_action = self.shadow_trainer.record(
@@ -1637,7 +1695,7 @@ class BotControllerV2:
                                 from .training.checkpoint_manager import compute_score
                                 score = compute_score({
                                     'click_accuracy': stats['avg_click_accuracy'],
-                                    'position_error': -stats['avg_pos_error'],
+                                    'position_error': stats['avg_pos_error'],  # weighted -0.2 in compute_score
                                 })
                                 self.checkpoint_manager.save(
                                     model=self.policy.executor,
@@ -1656,16 +1714,9 @@ class BotControllerV2:
                     # Capture human input for correction detection
                     human_action = self.shadow_trainer.input_capture.get_action()
                     if self.dagger.detect_correction(action, human_action):
-                        # Build target_info if not already built (shadow mode builds it above)
-                        if 'target_info_34' not in dir():
-                            target_info_34 = np.zeros(34, dtype=np.float32)
-                            if target_idx >= 0 and target_idx < len(state_dict['objects']):
-                                obj = state_dict['objects'][target_idx]
-                                target_info_34[0] = obj[0]
-                                target_info_34[1] = obj[1]
-                            else:
-                                target_info_34[0] = 0.5
-                                target_info_34[1] = 0.5
+                        # Same target_info layout as inference
+                        target_info_34 = build_target_info(
+                            state_dict['objects'], state_dict.get('object_mask'), target_idx)
                         goal = policy_output.get('goal', np.zeros(64, dtype=np.float32))
                         state_compact = state_dict['full_state'][:64]
                         self.dagger.record_correction(
@@ -1776,34 +1827,9 @@ class BotControllerV2:
                             # Fallback: estimate from detection confidence
                             target_hp = getattr(target_obj, 'confidence', 0.8)
 
-                    # Build proper 34-dim target_info matching unified.py format
-                    target_info_34 = np.zeros(34, dtype=np.float32)
-                    if target_idx >= 0 and target_idx < len(state_dict['objects']):
-                        obj = state_dict['objects'][target_idx]
-                        # Object feature layout from TrackedObject.to_feature_vector (20-dim):
-                        # [0-3]:   x, y, distance_to_player, angle_to_player (position)
-                        # [4-7]:   vx, vy, speed, heading (velocity)
-                        # [8-11]:  width, height, confidence, age_normalized (bbox)
-                        # [12-15]: hits_norm, time_since_update_norm, is_tracked, is_lost (tracking)
-                        # [16-19]: is_enemy, is_loot, is_player, is_other (class)
-                        target_info_34[0] = obj[0]   # x position
-                        target_info_34[1] = obj[1]   # y position
-                        target_info_34[2] = obj[4] if len(obj) > 4 else 0.0   # velocity x
-                        target_info_34[3] = obj[5] if len(obj) > 5 else 0.0   # velocity y
-                        target_info_34[4] = obj[6] if len(obj) > 6 else 0.0   # speed
-                        target_info_34[5] = obj[8] if len(obj) > 8 else 0.05  # width
-                        target_info_34[6] = obj[9] if len(obj) > 9 else 0.05  # height
-                        target_info_34[7] = obj[10] if len(obj) > 10 else 1.0 # confidence
-                        target_info_34[8] = obj[16] if len(obj) > 16 else 0.0 # is_enemy (FIXED: was obj[14])
-                        target_info_34[9] = obj[17] if len(obj) > 17 else 0.0 # is_loot (FIXED: was obj[15])
-                        # Copy remaining features as context
-                        for j in range(min(20, len(obj))):
-                            if 12 + j < 32:
-                                target_info_34[12 + j] = obj[j]
-                    else:
-                        # No valid target - use center
-                        target_info_34[0] = 0.5
-                        target_info_34[1] = 0.5
+                    # Build proper 34-dim target_info (shared with inference/training)
+                    target_info_34 = build_target_info(
+                        state_dict['objects'], state_dict.get('object_mask'), target_idx)
 
                     # Get visual features for outcome detection (if available)
                     global_visual = None
@@ -1825,7 +1851,9 @@ class BotControllerV2:
 
                             # ROI features for each tracked object
                             if tracked_objects:
-                                bboxes = [(obj.x, obj.y, obj.w, obj.h) for obj in tracked_objects[:16]]
+                                # TrackedObject has width/height (no w/h); the old
+                                # AttributeError was swallowed, so roi_visual was always None
+                                bboxes = [(obj.x, obj.y, obj.width, obj.height) for obj in tracked_objects[:16]]
                                 roi_visual = self.vision_encoder.encode_rois(frame, bboxes)
                         except Exception as e:
                             if self.debug_mode:
@@ -1977,7 +2005,7 @@ class BotControllerV2:
                                 from .training.checkpoint_manager import compute_score
                                 score = compute_score({
                                     'hit_rate': hit_rate,
-                                    'position_error': -stats.get('avg_pos_error', 0.1),
+                                    'position_error': stats.get('avg_pos_error', 0.1),  # weighted -0.2 in compute_score
                                 })
                                 self.checkpoint_manager.save(
                                     model=self.policy.executor,
@@ -2025,11 +2053,17 @@ class BotControllerV2:
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
+                inputs_released = False  # a normal frame ran; keys may be held again
+
             except Exception as e:
                 print(f"\n[V2] Error: {e}")
                 if self.debug_mode:
                     import traceback
                     traceback.print_exc()
+                # A frame failed part-way: don't leave shift/alt or a button held
+                if not inputs_released:
+                    self._release_all_inputs()
+                    inputs_released = True
                 time.sleep(0.1)
 
     def _can_act(self) -> bool:
@@ -2406,7 +2440,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='DarkOrbit V2 Bot Controller')
-    parser.add_argument('--model', type=str, default='F:/dev/bot/best.pt',
+    parser.add_argument('--model', type=str, default=DEFAULT_YOLO_MODEL_PATH,
                        help='Path to YOLO model')
     parser.add_argument('--policy-dir', type=str, default=None,
                        help='Directory with trained hierarchical policy')
@@ -2496,12 +2530,34 @@ def main():
         print("     Press F3 for emergency stop")
     print("     Press Ctrl+C to exit")
 
+    # Graceful shutdown on Ctrl+Break (sent by the launcher's Stop button) and
+    # SIGTERM: just ask the main loop below to stop, so stop() runs here on the
+    # main thread and finishes saving before the process exits.
+    import signal
+    import atexit
+
+    def _request_exit(signum, frame):
+        print(f"\n[V2] Signal {signum} received - stopping...")
+        bot.running = False
+
+    for sig_name in ('SIGBREAK', 'SIGTERM'):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _request_exit)
+            except (ValueError, OSError):
+                pass
+    atexit.register(bot.stop)  # last resort; stop() only runs once
+
     bot.start()
 
     try:
         while bot.running:
-            time.sleep(1)
+            time.sleep(0.5)
     except KeyboardInterrupt:
+        pass
+    finally:
+        # F3, Ctrl+C, signal or loop exit: save and release inputs
         bot.stop()
 
 

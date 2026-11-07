@@ -692,9 +692,21 @@ Be concise and actionable. Focus on what should change, not what's working."""
         object_track_ids = []
         tracked_objects_snapshot = []  # Full object data snapshot
         if tracked_objects:
+            # Player position (first two player features) - the 20D object
+            # features are relative to it, exactly as the tactician sees them
+            player = state_dict.get('player') if state_dict else None
+            player_x = float(player[0]) if player is not None and len(player) > 1 else 0.5
+            player_y = float(player[1]) if player is not None and len(player) > 1 else 0.5
             for obj in tracked_objects:
                 track_id = getattr(obj, 'track_id', -1)
                 object_track_ids.append(track_id)
+
+                # TrackedObject has a to_feature_vector() method, not a
+                # 'feature_vector' attribute (the old getattr always saved zeros)
+                if hasattr(obj, 'to_feature_vector'):
+                    feature_vector = obj.to_feature_vector(player_x, player_y)
+                else:
+                    feature_vector = getattr(obj, 'feature_vector', [0] * 20)
 
                 # Save full object info for tactician (in case object disappears before training)
                 tracked_objects_snapshot.append({
@@ -703,7 +715,7 @@ Be concise and actionable. Focus on what should change, not what's working."""
                     'x': getattr(obj, 'x', 0.5),
                     'y': getattr(obj, 'y', 0.5),
                     'confidence': getattr(obj, 'confidence', 0.0),
-                    'feature_vector': getattr(obj, 'feature_vector', [0] * 20)  # Full 20D feature
+                    'feature_vector': feature_vector  # Full 20D feature
                 })
 
         correction = {

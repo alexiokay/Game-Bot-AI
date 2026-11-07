@@ -8,6 +8,11 @@ from dataclasses import dataclass, field
 from typing import List, Optional, FrozenSet, Tuple, Dict
 from enum import IntEnum
 import logging
+from pathlib import Path
+
+# Default YOLO detector weights: <repo root>/best.pt (repo root = two levels above
+# this v2 package). Relative to the code, so it survives drive-letter changes.
+DEFAULT_YOLO_MODEL_PATH = str(Path(__file__).resolve().parents[2] / "best.pt")
 
 # Setup module logger
 logger = logging.getLogger(__name__)
@@ -185,7 +190,7 @@ class VisionEncoderConfig:
 class PerceptionConfig:
     """Object detection and tracking configuration."""
     # YOLO
-    yolo_model_path: str = "F:/dev/bot/best.pt"
+    yolo_model_path: str = DEFAULT_YOLO_MODEL_PATH
     yolo_confidence: float = 0.5
     yolo_device: str = "cuda"
 

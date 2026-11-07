@@ -47,6 +47,7 @@ except ImportError:
 
 # Local imports
 from ..config import (
+    DEFAULT_YOLO_MODEL_PATH,
     V2Config, TacticianConfig, StrategistConfig,
     ENEMY_CLASSES, LOOT_CLASSES,
     KEYBOARD_KEYS, NUM_KEYBOARD_KEYS,
@@ -298,7 +299,12 @@ class V2Recorder:
     def _toggle_recording(self):
         """Toggle recording on/off. When stopping, exits the app."""
         if self.is_recording:
-            self.stop(exit_app=True)  # Exit when F5 stops recording
+            # Only signal here: this runs on the pynput listener thread, and
+            # calling stop() from it let main() exit while the SESSION_END save
+            # was still being written. main() calls stop() (which saves) on the
+            # main thread once running is False, then the app exits.
+            print("\nF5 - stopping recording and exiting...")
+            self.running = False
         else:
             self.start()
 
@@ -743,7 +749,7 @@ def main():
     import sys
 
     parser = argparse.ArgumentParser(description='V2 Recorder')
-    parser.add_argument('--model', type=str, default='F:/dev/bot/best.pt',
+    parser.add_argument('--model', type=str, default=DEFAULT_YOLO_MODEL_PATH,
                        help='Path to YOLO model')
     parser.add_argument('--monitor', type=int, default=1,
                        help='Monitor to capture')
@@ -789,6 +795,21 @@ def main():
 
     # Set running flag so the main loop continues
     recorder.running = True
+
+    # Ctrl+Break from the launcher's Stop button / SIGTERM: stop gracefully
+    import signal
+
+    def _request_exit(signum, frame):
+        print(f"\nSignal {signum} received - stopping recorder...")
+        recorder.running = False
+
+    for sig_name in ('SIGBREAK', 'SIGTERM'):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _request_exit)
+            except (ValueError, OSError):
+                pass
 
     try:
         while recorder.running:

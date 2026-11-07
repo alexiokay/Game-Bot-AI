@@ -658,6 +658,26 @@ class ExecutorV2(nn.Module):
 
         return mouse_raw, click_logit, keyboard_logits
 
+    def ensure_stacked(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        Accept a single-frame state [B, state_dim] as well as a frame-stacked one
+        [B, state_dim * frame_stack_size]. A single frame is repeated to fill the
+        stack (same as inference does before it has enough history), so callers
+        without a frame history no longer crash with a shape mismatch.
+        """
+        stacked_dim = self.state_dim * self.frame_stack_size
+        if self.frame_stack_size > 1 and state.shape[-1] == self.state_dim:
+            if not getattr(self, '_warned_single_frame', False):
+                print(f"[ExecutorV2] Got single-frame state ({self.state_dim}); "
+                      f"repeating it x{self.frame_stack_size} to fill the frame stack")
+                self._warned_single_frame = True
+            return state.repeat(*([1] * (state.dim() - 1)), self.frame_stack_size)
+        if state.shape[-1] != stacked_dim:
+            raise ValueError(
+                f"ExecutorV2 expects state of size {self.state_dim} (single frame) or "
+                f"{stacked_dim} (stack of {self.frame_stack_size}), got {state.shape[-1]}")
+        return state
+
     def forward(self,
                 state: torch.Tensor,
                 goal: torch.Tensor,
@@ -679,6 +699,7 @@ class ExecutorV2(nn.Module):
             Shapes: [B, C, dim] if chunk_size > 1, else [B, dim]
         """
         # Build input
+        state = self.ensure_stacked(state)
         parts = [state, goal, target_info]
         if visual_features is not None and self.visual_dim > 0:
             parts.append(visual_features)

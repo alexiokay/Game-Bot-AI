@@ -24,7 +24,7 @@ import time
 import logging
 import ctypes
 
-from .training_utils import TrainingLogger, WarmupCosineScheduler, gradient_norm
+from .training_utils import TrainingLogger, WarmupCosineScheduler, gradient_norm, atomic_torch_save
 from ..config import KEYBOARD_KEYS, NUM_KEYBOARD_KEYS
 
 logger = logging.getLogger(__name__)
@@ -380,6 +380,11 @@ class ShadowTrainer:
         from ..models.executor import ExecutorV2
         self.is_v2 = isinstance(executor, ExecutorV2)
 
+        # Frame stacking (ExecutorV2 sees the last N compact states at inference,
+        # so demonstrations must store the same stack)
+        self.frame_stack_size = getattr(executor, 'frame_stack_size', 1) if self.is_v2 else 1
+        self._state_stack = deque(maxlen=self.frame_stack_size)
+
         # Detect visual model
         self.visual_model = False
         self.target_info_dim = 34
@@ -520,6 +525,14 @@ class ShadowTrainer:
         elif len(state) > 64:
             state = state[:64]
 
+        # Build the frame-stacked executor state (oldest -> newest), padding with
+        # the oldest frame until the history is full, exactly like inference
+        self._state_stack.append(np.asarray(state, dtype=np.float32).copy())
+        frames = list(self._state_stack)
+        if len(frames) < self.frame_stack_size:
+            frames = [frames[0]] * (self.frame_stack_size - len(frames)) + frames
+        stacked_state = np.concatenate(frames, axis=0)
+
         if len(goal) < 64:
             goal = np.pad(goal, (0, 64 - len(goal)), mode='constant')
         elif len(goal) > 64:
@@ -560,7 +573,8 @@ class ShadowTrainer:
 
         # Build base demonstration for executor training
         demo = {
-            'state': state.astype(np.float32),
+            'state': state.astype(np.float32),  # current compact frame (64)
+            'stacked_state': stacked_state.astype(np.float32),  # [64 * frame_stack_size]
             'goal': goal.astype(np.float32),
             'target_info': target_info.astype(np.float32),
             'action': action_array,  # Legacy format
@@ -716,8 +730,10 @@ class ShadowTrainer:
             return None
 
         # Convert to tensors
+        # ExecutorV2 trains on the same frame stack it sees at inference
+        state_key = 'stacked_state' if self.is_v2 and all('stacked_state' in b for b in batch) else 'state'
         states = torch.tensor(
-            np.stack([b['state'] for b in batch]),
+            np.stack([b[state_key] for b in batch]),
             dtype=torch.float32
         ).to(self.device)
 
@@ -901,7 +917,14 @@ class ShadowTrainer:
             goal_t = torch.tensor(goal, dtype=torch.float32).unsqueeze(0).to(self.device)
             target_t = torch.tensor(target_info, dtype=torch.float32).unsqueeze(0).to(self.device)
 
-            action, _ = self.executor.forward(state_t, goal_t, target_t)
+            if self.is_v2:
+                # ExecutorV2.forward returns a dict; forward_legacy gives the flat
+                # [mouse_x_logit, mouse_y_logit, click_logit, ...] tensor used below
+                if state_t.shape[-1] > 64 and state_t.shape[-1] != 64 * self.frame_stack_size:
+                    state_t = state_t[:, :64]
+                action, _ = self.executor.forward_legacy(state_t, goal_t, target_t)
+            else:
+                action, _ = self.executor.forward(state_t, goal_t, target_t)
             action = action.cpu().numpy()[0]
 
         def sigmoid(x):
@@ -949,7 +972,7 @@ class ShadowTrainer:
         if self.lr_scheduler:
             checkpoint['lr_scheduler_state'] = self.lr_scheduler.state_dict()
 
-        torch.save(checkpoint, path)
+        atomic_torch_save(checkpoint, path)  # never leave a half-written executor.pt
         logger.info(f"[ShadowTrainer] Checkpoint saved to {path}")
 
     def load_checkpoint(self, path: str):
@@ -971,6 +994,7 @@ class ShadowTrainer:
         """Reset for new session (keeps learned weights)."""
         self.human_clicks = 0
         self.total_frames = 0
+        self._state_stack.clear()  # frame history must not span sessions
         # Don't clear buffer - keep demonstrations across sessions
 
     def save_full_recordings(self, filename: Optional[str] = None):

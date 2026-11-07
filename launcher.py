@@ -18,6 +18,9 @@ import json
 
 # Ensure we're in the bot directory
 BOT_DIR = Path(__file__).parent.absolute()
+DEFAULT_MODEL_PATH = str(BOT_DIR / "best.pt")  # YOLO detector weights in the repo root
+# Seconds the bot gets to save models/recordings after Stop before it is force-killed
+GRACEFUL_STOP_TIMEOUT = 20.0
 os.chdir(BOT_DIR)
 
 # Config file for persistent settings
@@ -313,9 +316,37 @@ class BotLauncher:
         self._kill_all_processes()
         self.root.destroy()
 
-    def _kill_process_tree(self, proc):
-        """Kill a process and all its children (Windows-compatible)."""
+    def _request_graceful_stop(self, proc, timeout: float) -> bool:
+        """Ask a bot/recorder process to stop cleanly (it saves models and
+        recordings and releases held keys), waiting up to `timeout` seconds.
+        Returns True if it exited."""
+        if proc is None or proc.poll() is not None:
+            return True
+        try:
+            if sys.platform == 'win32':
+                import signal
+                # Child was started in its own process group, so this reaches
+                # uv and the Python bot, which handles SIGBREAK -> stop()
+                os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
+            else:
+                proc.send_signal(__import__('signal').SIGINT)
+        except Exception as e:
+            print(f"[LAUNCHER] Graceful stop not possible ({e}), forcing")
+            return False
+        try:
+            proc.wait(timeout=timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            print(f"[LAUNCHER] Process did not exit within {timeout:.0f}s, forcing")
+            return False
+
+    def _kill_process_tree(self, proc, graceful_timeout: float = 0.0):
+        """Kill a process and all its children (Windows-compatible).
+        With graceful_timeout > 0, first ask it to stop cleanly."""
         if proc is None:
+            return
+
+        if graceful_timeout > 0 and self._request_graceful_stop(proc, graceful_timeout):
             return
 
         try:
@@ -357,8 +388,8 @@ class BotLauncher:
         """Kill all tracked child processes."""
         # Kill main process
         if self.current_process:
-            print(f"[LAUNCHER] Killing main process (PID: {self.current_process.pid})")
-            self._kill_process_tree(self.current_process)
+            print(f"[LAUNCHER] Stopping main process (PID: {self.current_process.pid})")
+            self._kill_process_tree(self.current_process, graceful_timeout=GRACEFUL_STOP_TIMEOUT)
             self.current_process = None
 
         # Kill debug viewer
@@ -761,12 +792,16 @@ class BotLauncher:
         self.log("")
 
         def run():
+            proc = None
             try:
                 import os
                 env = os.environ.copy()
                 env['PYTHONUNBUFFERED'] = '1'
+                # stdout is a pipe, so without this the child writes cp1252 and any
+                # emoji print (✅ 📊 📡 ...) raises UnicodeEncodeError; we decode UTF-8
+                env['PYTHONIOENCODING'] = 'utf-8'
 
-                self.current_process = subprocess.Popen(
+                proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -775,15 +810,19 @@ class BotLauncher:
                     errors='replace',
                     bufsize=0,
                     cwd=str(BOT_DIR),
-                    env=env
+                    env=env,
+                    # Own process group so Stop can send Ctrl+Break for a clean shutdown
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == 'win32' else 0
                 )
+                self.current_process = proc
 
-                # Read output line by line
-                for line in self.current_process.stdout:
+                # Read output line by line (use the local handle: Stop clears
+                # self.current_process while this thread is still reading)
+                for line in proc.stdout:
                     self.root.after(0, self.log, line.rstrip())
 
-                self.current_process.wait()
-                exit_code = self.current_process.returncode
+                proc.wait()
+                exit_code = proc.returncode
 
                 if exit_code == 0:
                     self.root.after(0, self.log, f"\n✓ {description} completed successfully")
@@ -798,7 +837,9 @@ class BotLauncher:
 
             finally:
                 self.running = False
-                self.current_process = None
+                # Only clear our own process (a quick re-run may already own the slot)
+                if proc is not None and self.current_process is proc:
+                    self.current_process = None
                 self.root.after(0, self.btn_stop.configure, {"state": "disabled"})
                 self.root.after(0, self.enable_all_buttons)
                 self.root.after(0, self._hide_hotkeys)
@@ -809,28 +850,37 @@ class BotLauncher:
     def stop_process(self):
         """Stop the current running process and all children."""
         self.log("\n[LAUNCHER] Stopping all processes...")
-
-        # Kill main process tree
-        if self.current_process:
-            self.log(f"[LAUNCHER] Killing main process (PID: {self.current_process.pid})...")
-            self._kill_process_tree(self.current_process)
-            self.current_process = None
-            self.log("[LAUNCHER] Main process stopped")
-
-        # Kill debug viewer tree
-        if self._debug_viewer_process:
-            self.log(f"[LAUNCHER] Killing debug viewer (PID: {self._debug_viewer_process.pid})...")
-            self._kill_process_tree(self._debug_viewer_process)
-            self._debug_viewer_process = None
-            self.log("[LAUNCHER] Debug viewer stopped")
-
-        # Reset state
-        self.running = False
-        self._debug_viewer_launched = False
-        self.status_label.configure(text="Stopped")
         self.btn_stop.configure(state="disabled")
-        self.enable_all_buttons()
-        self._hide_hotkeys()
+        self.status_label.configure(text="Stopping (saving)...")
+
+        main_proc = self.current_process
+        viewer_proc = self._debug_viewer_process
+        self.current_process = None
+        self._debug_viewer_process = None
+
+        def do_stop():
+            # Graceful first (bot saves models/recordings and releases keys),
+            # off the UI thread so the window doesn't freeze while it saves
+            if main_proc:
+                self.root.after(0, self.log, f"[LAUNCHER] Asking main process (PID: {main_proc.pid}) to stop...")
+                self._kill_process_tree(main_proc, graceful_timeout=GRACEFUL_STOP_TIMEOUT)
+                self.root.after(0, self.log, "[LAUNCHER] Main process stopped")
+            if viewer_proc:
+                self.root.after(0, self.log, f"[LAUNCHER] Killing debug viewer (PID: {viewer_proc.pid})...")
+                self._kill_process_tree(viewer_proc)
+                self.root.after(0, self.log, "[LAUNCHER] Debug viewer stopped")
+            self.root.after(0, finish)
+
+        def finish():
+            # Reset state
+            self.running = False
+            self._debug_viewer_launched = False
+            self.status_label.configure(text="Stopped")
+            self.btn_stop.configure(state="disabled")
+            self.enable_all_buttons()
+            self._hide_hotkeys()
+
+        threading.Thread(target=do_stop, daemon=True).start()
 
     def _launch_debug_viewer_subprocess(self, monitor: int):
         """Launch debug viewer as a separate subprocess (once only)."""
@@ -922,7 +972,7 @@ class BotLauncher:
         """Configure pure recording options."""
         cfg = self.config.get('pure_recording', {})
         fields = [
-            ('model', 'YOLO Model Path', cfg.get('model', 'F:/dev/bot/best.pt'), 'file'),
+            ('model', 'YOLO Model Path', cfg.get('model', DEFAULT_MODEL_PATH), 'file'),
             ('monitor', 'Monitor Number', cfg.get('monitor', 1), 'int'),
         ]
 
@@ -1153,9 +1203,17 @@ class BotLauncher:
             messagebox.showinfo("Saved", "Debug viewer configuration saved!")
 
     # Command runners
+    def _yolo_model_path(self, cfg: dict) -> str:
+        """YOLO weights for bot runs: the run's own 'model' setting, else the
+        'YOLO Model Path' set under Pure Recording, else <repo>/best.pt."""
+        return (cfg.get('model')
+                or self.config.get('pure_recording', {}).get('model')
+                or DEFAULT_MODEL_PATH)
+
     def run_shadow_training(self):
         cfg = self.config.get('shadow_training', {})
-        cmd = ["uv", "run", "python", "-m", "darkorbit_bot.v2.bot_controller_v2", "--shadow-train"]
+        cmd = ["uv", "run", "python", "-m", "darkorbit_bot.v2.bot_controller_v2", "--shadow-train",
+               "--model", self._yolo_model_path(cfg)]
 
         if cfg.get('save_recordings', True):
             cmd.append("--save-recordings")
@@ -1181,7 +1239,7 @@ class BotLauncher:
     def run_pure_recording(self):
         cfg = self.config.get('pure_recording', {})
         cmd = ["uv", "run", "python", "-m", "darkorbit_bot.v2.recording.recorder_v2",
-               "--model", cfg.get('model', 'F:/dev/bot/best.pt'),
+               "--model", cfg.get('model', DEFAULT_MODEL_PATH),
                "--monitor", str(cfg.get('monitor', 1))]
         self.run_command(cmd, "Pure Recording", script_type='recording')
 
@@ -1235,7 +1293,8 @@ class BotLauncher:
 
     def run_bot(self):
         cfg = self.config.get('run_bot', {})
-        cmd = ["uv", "run", "python", "-m", "darkorbit_bot.v2.bot_controller_v2"]
+        cmd = ["uv", "run", "python", "-m", "darkorbit_bot.v2.bot_controller_v2",
+               "--model", self._yolo_model_path(cfg)]
 
         if cfg.get('policy_dir'):
             cmd.extend(["--policy-dir", cfg['policy_dir']])

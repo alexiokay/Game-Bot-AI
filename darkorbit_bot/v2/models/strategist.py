@@ -454,7 +454,10 @@ def load_strategist(path: str, device: str = "cuda") -> nn.Module:
     if not with_visual and 'state_encoder.0.weight' in state_dict:
         # Check input dimension to detect visual model
         input_weight = state_dict['state_encoder.0.weight']
-        if input_weight.shape[1] > 300:  # Visual model has 704 input dim
+        # Non-visual input is FULL_STATE_DIM (352); visual adds 512 (= 864).
+        # (The old "> 300" threshold dated from the 192-dim state and misread
+        # every non-visual 352-dim checkpoint as visual.)
+        if input_weight.shape[1] > FULL_STATE_DIM + 100:
             with_visual = True
 
     model = create_strategist(with_context=with_context, with_visual=with_visual, device=device)

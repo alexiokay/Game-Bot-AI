@@ -727,3 +727,16 @@ def gradient_norm(model: nn.Module) -> float:
             param_norm = p.grad.data.norm(2)
             total_norm += param_norm.item() ** 2
     return total_norm ** 0.5
+
+
+def atomic_torch_save(obj, path) -> None:
+    """torch.save to a temp file next to `path`, then atomically replace `path`.
+    If the process is killed mid-save, the previous good checkpoint survives
+    instead of being left as a truncated, unloadable file."""
+    import os
+    from pathlib import Path
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(obj, str(tmp))
+    os.replace(str(tmp), str(path))

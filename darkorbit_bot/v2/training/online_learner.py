@@ -27,7 +27,7 @@ from collections import deque
 import time
 import logging
 
-from .training_utils import TrainingLogger, WarmupCosineScheduler, gradient_norm
+from .training_utils import TrainingLogger, WarmupCosineScheduler, gradient_norm, atomic_torch_save
 from ..config import KEYBOARD_KEYS, NUM_KEYBOARD_KEYS
 
 logger = logging.getLogger(__name__)
@@ -109,7 +109,18 @@ class OnlineLearner:
         self.visual_dim = 0
         self.target_info_dim = 34  # Base dimension
 
-        if hasattr(executor, 'input_proj') and hasattr(executor.input_proj[0], 'in_features'):
+        # ExecutorV2 takes a frame-stacked state, returns a dict and receives visual
+        # features separately (never appended to target_info), so its input size
+        # can't be used to detect a visual model.
+        from ..models.executor import ExecutorV2
+        self.is_v2 = isinstance(executor, ExecutorV2)
+        self.frame_stack_size = getattr(executor, 'frame_stack_size', 1) if self.is_v2 else 1
+        self._state_stack = deque(maxlen=self.frame_stack_size)
+
+        if self.is_v2:
+            logger.info(f"[OnlineLearner] ExecutorV2 (frame_stack={self.frame_stack_size}, "
+                        f"target_info_dim={self.target_info_dim})")
+        elif hasattr(executor, 'input_proj') and hasattr(executor.input_proj[0], 'in_features'):
             input_dim = executor.input_proj[0].in_features
             # Non-visual: 64+64+34=162, Visual: 64+64+98=226
             if input_dim > 200:
@@ -201,6 +212,13 @@ class OnlineLearner:
         elif len(state) > 64:
             state = state[:64]
 
+        # Frame stack for ExecutorV2 (updated every frame, even ones not stored)
+        self._state_stack.append(np.asarray(state, dtype=np.float32).copy())
+        frames = list(self._state_stack)
+        if len(frames) < self.frame_stack_size:
+            frames = [frames[0]] * (self.frame_stack_size - len(frames)) + frames
+        stacked_state = np.concatenate(frames, axis=0)
+
         if len(goal) < 64:
             goal = np.pad(goal, (0, 64 - len(goal)), mode='constant')
         elif len(goal) > 64:
@@ -289,7 +307,7 @@ class OnlineLearner:
                 action_array[3 + i] = 3.0 if key_pressed else -3.0
 
             self.buffer.add({
-                'state': state.astype(np.float32),
+                'state': stacked_state.astype(np.float32) if self.is_v2 else state.astype(np.float32),
                 'goal': goal.astype(np.float32),
                 'target_info': target_info.astype(np.float32),
                 'action': action_array,
@@ -354,7 +372,9 @@ class OnlineLearner:
             dtype=torch.float32
         ).to(self.device)
 
-        # Normalize rewards (important for stability)
+        raw_reward_mean = float(rewards.mean())  # for logging (before normalising)
+
+        # Normalize rewards into advantages (important for stability)
         if rewards.std() > 0.01:
             rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
@@ -363,7 +383,12 @@ class OnlineLearner:
 
         # Get model output (raw logits)
         with torch.enable_grad():
-            predicted_action, _ = self.executor.forward(states, goals, target_infos)
+            if self.is_v2:
+                # ExecutorV2.forward returns a dict; forward_legacy gives the flat
+                # [mouse_x_logit, mouse_y_logit, click_logit, ...keyboard] tensor
+                predicted_action, _ = self.executor.forward_legacy(states, goals, target_infos)
+            else:
+                predicted_action, _ = self.executor.forward(states, goals, target_infos)
 
             # Loss: weighted MSE where weight = reward
             # Positive reward = reduce loss (reinforce action)
@@ -383,19 +408,22 @@ class OnlineLearner:
                 reduction='none'
             )
 
-            # Combined loss weighted by reward
-            # Positive reward → we want to move TOWARD this action (reduce loss effect)
-            # Negative reward → we want to move AWAY from this action (increase loss effect)
-            # Use: loss * (1 - reward) so positive reward reduces gradient
-            weights = (1.0 - rewards.clamp(-1, 1)) / 2.0 + 0.5  # Map [-1,1] to [1, 0.5]
+            # Reward-weighted imitation (advantage-weighted regression style).
+            # This loss always pulls the model TOWARD the executed action, so
+            # only actions that did better than average may get weight:
+            #   weight = max(advantage, 0)
+            # Below-average actions get weight 0 - imitating them, even weakly,
+            # would teach the bad action. (The old mapping (1 - r)/2 + 0.5 gave a
+            # miss weight 1.5 and a hit 0.5, i.e. it reinforced misses 3x harder.)
+            weights = rewards.clamp(-1, 1).clamp(min=0.0)
+            weight_sum = weights.sum()
+            if weight_sum.item() < 1e-6:
+                # No better-than-average action in this batch: nothing to learn
+                self.executor.eval()
+                self.last_update_time = time.time()
+                return None
 
-            # Actually for RL, we want:
-            # - Good actions (high reward): make model output closer to this
-            # - Bad actions (low reward): make model output farther from this
-            # Standard approach: -reward * log_prob, but we're doing regression
-            # So: loss = MSE * (1 - reward) where reward in [-1, 1] normalized
-
-            loss = (pos_loss * weights + click_loss * weights * 0.5).mean()
+            loss = (pos_loss * weights + click_loss * weights * 0.5).sum() / weight_sum
 
             # Backprop
             loss.backward()
@@ -431,7 +459,7 @@ class OnlineLearner:
         self.training_logger.log_scalar("Loss/position", pos_loss.mean().item(), self.total_updates)
         self.training_logger.log_scalar("Loss/click", click_loss.mean().item(), self.total_updates)
         self.training_logger.log_scalar("Metrics/hit_rate", hit_rate, self.total_updates)
-        self.training_logger.log_scalar("Metrics/avg_reward", float(rewards.mean()), self.total_updates)
+        self.training_logger.log_scalar("Metrics/avg_reward", raw_reward_mean, self.total_updates)
         self.training_logger.log_scalar("Metrics/buffer_size", len(self.buffer), self.total_updates)
         self.training_logger.log_scalar("LR/learning_rate", self.stats['learning_rate'], self.total_updates)
 
@@ -457,6 +485,7 @@ class OnlineLearner:
         self.prev_target_dist = None
         self.prev_mouse_pos = None
         self.prev_target_pos = None
+        self._state_stack.clear()
 
     def get_stats(self) -> Dict:
         """Get learning statistics."""
@@ -483,7 +512,7 @@ class OnlineLearner:
         if self.lr_scheduler:
             checkpoint['lr_scheduler_state'] = self.lr_scheduler.state_dict()
 
-        torch.save(checkpoint, path)
+        atomic_torch_save(checkpoint, path)  # never leave a half-written executor.pt
         logger.info(f"[OnlineLearner] Checkpoint saved to {path}")
 
     def load_checkpoint(self, path: str):

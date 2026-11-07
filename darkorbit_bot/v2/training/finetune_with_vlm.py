@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from v2.models.executor import create_executor, save_executor, load_executor, ExecutorV2
 from v2.models.strategist import create_strategist, save_strategist, load_strategist
 from v2.models.tactician import create_tactician, save_tactician, load_tactician
+from v2.models.unified import build_target_info  # same layout as inference
 from v2.config import ExecutorConfig, StrategistConfig, TacticianConfig, TrainingConfig, Mode, KEYBOARD_KEYS, NUM_KEYBOARD_KEYS, FULL_STATE_DIM
 from v2.training.train_executor import ExecutorLossV2
 from v2.training.train_tactician import TacticianLoss
@@ -167,46 +168,16 @@ class VLMCorrectionDataset(Dataset):
         else:
             goal = np.zeros(64, dtype=np.float32)
 
-        # Build target_info from OBJECT features (not mouse position!)
-        target_info = np.zeros(34, dtype=np.float32)
-
-        # Try to get object data from correction
+        # Build target_info from OBJECT features, exactly like inference.
+        # Never put the corrected mouse position in it: that is the label
+        # (the old code wrote corrected - object into [10-11], and with no
+        # objects used the corrected position as the target).
         objects = corr.get('objects', []) if corr else []
         object_mask = corr.get('object_mask', []) if corr else []
         target_idx = corr.get('target_idx', policy_output.get('target_idx', -1)) if corr else -1
-
-        if objects and target_idx >= 0 and target_idx < len(objects):
-            obj = objects[target_idx]
-            if isinstance(obj, list) and len(obj) >= 2:
-                # Object feature layout from TrackedObject.to_feature_vector (20-dim):
-                # [0-3]:   x, y, distance_to_player, angle_to_player (position)
-                # [4-7]:   vx, vy, speed, heading (velocity)
-                # [8-11]:  width, height, confidence, age_normalized (bbox)
-                # [12-15]: hits_norm, time_since_update_norm, is_tracked, is_lost (tracking)
-                # [16-19]: is_enemy, is_loot, is_player, is_other (class)
-
-                target_info[0] = obj[0]   # Object x position
-                target_info[1] = obj[1]   # Object y position
-                target_info[2] = obj[4] if len(obj) > 4 else 0.0   # velocity x
-                target_info[3] = obj[5] if len(obj) > 5 else 0.0   # velocity y
-                target_info[4] = obj[6] if len(obj) > 6 else 0.0   # speed
-                target_info[5] = obj[8] if len(obj) > 8 else 0.05  # width
-                target_info[6] = obj[9] if len(obj) > 9 else 0.05  # height
-                target_info[7] = obj[10] if len(obj) > 10 else 1.0 # confidence
-                target_info[8] = obj[16] if len(obj) > 16 else 0.0 # is_enemy (FIXED: was obj[14])
-                target_info[9] = obj[17] if len(obj) > 17 else 0.0 # is_loot (FIXED: was obj[15])
-                # [10-11] aim offset - will be learned
-                target_info[10] = corrected_x - obj[0]  # Relative aim offset X
-                target_info[11] = corrected_y - obj[1]  # Relative aim offset Y
-                # Copy remaining features
-                for j in range(min(20, len(obj))):
-                    if 12 + j < 32:
-                        target_info[12 + j] = obj[j]
-        else:
-            # Fallback: no object data available (old format corrections)
-            # Use corrected position as both - this is less useful but better than nothing
-            target_info[0] = corrected_x
-            target_info[1] = corrected_y
+        if not objects or not isinstance(target_idx, int):
+            target_idx = -1
+        target_info = build_target_info(objects or None, object_mask or None, target_idx)
 
         # Build corrected action (where mouse SHOULD be)
         # Full 31-dim format: [mouse_x, mouse_y, click, ...keyboard_keys...]
@@ -659,7 +630,7 @@ def finetune_executor(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_model_state = model.state_dict().copy()
+            best_model_state = {k: v.detach().clone() for k, v in model.state_dict().items()}  # real copy, not aliases of live weights
             print(f"   [OK] New best model! Val loss: {best_val_loss:.4f}")
 
     # Load best and save
@@ -828,7 +799,7 @@ def finetune_strategist(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_model_state = model.state_dict().copy()
+            best_model_state = {k: v.detach().clone() for k, v in model.state_dict().items()}  # real copy, not aliases of live weights
             print(f"   [OK] New best model!")
 
     if best_model_state:
@@ -1003,7 +974,7 @@ def finetune_tactician(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_model_state = model.state_dict().copy()
+            best_model_state = {k: v.detach().clone() for k, v in model.state_dict().items()}  # real copy, not aliases of live weights
             print(f"   [OK] New best model!")
 
     if best_model_state:

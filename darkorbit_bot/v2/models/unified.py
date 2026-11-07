@@ -18,6 +18,48 @@ from .tactician import Tactician, create_tactician
 from .executor import Executor, ExecutorV2, create_executor
 
 
+TARGET_INFO_DIM = 34
+
+
+def build_target_info(objects, object_mask, target_idx: int) -> np.ndarray:
+    """
+    Executor target_info [34] for the object at target_idx - the ONE place this
+    layout is built, used at inference, in offline training and for shadow
+    recordings so all three match.
+
+    Layout (object features from TrackedObject.to_feature_vector, 20-dim):
+      [0-1]   target x, y            [2-3] target vx, vy    [4] speed
+      [5-6]   width, height          [7]   confidence
+      [8]     is_enemy               [9]   is_loot
+      [10-11] always 0 (never the human's aim/mouse: that is the label)
+      [12-31] the 20 raw object features
+      [32-33] reserved (0)
+    No valid target: x, y = 0.5, 0.5 (screen centre) and everything else 0.
+    """
+    target_info = np.zeros(TARGET_INFO_DIM, dtype=np.float32)
+    mask_ok = (object_mask is None or target_idx >= len(object_mask)
+               or object_mask[target_idx] > 0)
+    if objects is not None and 0 <= target_idx < len(objects) and mask_ok:
+        obj = np.asarray(objects[target_idx], dtype=np.float32)
+        n = len(obj)
+        target_info[0] = obj[0]
+        target_info[1] = obj[1]
+        target_info[2] = obj[4] if n > 4 else 0.0
+        target_info[3] = obj[5] if n > 5 else 0.0
+        target_info[4] = obj[6] if n > 6 else 0.0
+        target_info[5] = obj[8] if n > 8 else 0.05
+        target_info[6] = obj[9] if n > 9 else 0.05
+        target_info[7] = obj[10] if n > 10 else 1.0
+        target_info[8] = obj[16] if n > 16 else 0.0
+        target_info[9] = obj[17] if n > 17 else 0.0
+        k = min(20, n)
+        target_info[12:12 + k] = obj[:k]
+    else:
+        target_info[0] = 0.5
+        target_info[1] = 0.5
+    return target_info
+
+
 @dataclass
 class HierarchicalState:
     """Current state of the hierarchical system."""
@@ -222,40 +264,11 @@ class HierarchicalPolicy(nn.Module):
         goal = self.state.goal if self.state.goal is not None else self.default_goal
         target_idx = self.state.target_idx
 
-        # Build target_info from raw object features (matching training format)
-        target_info = np.zeros(34, dtype=np.float32)
+        # Build target_info from raw object features (shared with training)
+        target_info = build_target_info(objects, object_mask, target_idx)
 
         # DEBUG: Track what objects we have
         valid_objects = int(np.sum(object_mask))
-
-        if target_idx >= 0 and target_idx < len(objects) and object_mask[target_idx] > 0:
-            obj = objects[target_idx]
-            # Object feature layout from TrackedObject.to_feature_vector (20-dim):
-            # [0-3]:   x, y, distance_to_player, angle_to_player (position)
-            # [4-7]:   vx, vy, speed, heading (velocity)
-            # [8-11]:  width, height, confidence, age_normalized (bbox)
-            # [12-15]: hits_norm, time_since_update_norm, is_tracked, is_lost (tracking)
-            # [16-19]: is_enemy, is_loot, is_player, is_other (class)
-
-            target_info[0] = obj[0]   # x position
-            target_info[1] = obj[1]   # y position
-            target_info[2] = obj[4] if len(obj) > 4 else 0.0   # velocity x
-            target_info[3] = obj[5] if len(obj) > 5 else 0.0   # velocity y
-            target_info[4] = obj[6] if len(obj) > 6 else 0.0   # speed
-            target_info[5] = obj[8] if len(obj) > 8 else 0.05  # width
-            target_info[6] = obj[9] if len(obj) > 9 else 0.05  # height
-            target_info[7] = obj[10] if len(obj) > 10 else 1.0 # confidence
-            target_info[8] = obj[16] if len(obj) > 16 else 0.0 # is_enemy
-            target_info[9] = obj[17] if len(obj) > 17 else 0.0 # is_loot
-            # [10-11] aim offset - model will learn to predict this
-            # Copy remaining object features as context
-            for j in range(min(20, len(obj))):
-                if 12 + j < 32:
-                    target_info[12 + j] = obj[j]
-        else:
-            # No valid target - use center position, zero features
-            target_info[0] = 0.5  # x = center
-            target_info[1] = 0.5  # y = center
 
         # Also store target position for diagnostics
         self.state.target_x = target_info[0]
@@ -415,9 +428,48 @@ def load_hierarchical_policy(directory: str, device: str = "cuda") -> Hierarchic
 
     dir_path = Path(directory)
 
-    strategist = load_strategist(str(dir_path / "strategist" / "best_model.pt"), device=device)
-    tactician = load_tactician(str(dir_path / "tactician" / "best_model.pt"), device=device)
-    executor = load_executor(str(dir_path / "executor" / "best_model.pt"), device=device)
+    from ..config import V2Config
+    config = V2Config()
+
+    def _find(name: str):
+        # Flat layout ({dir}/executor.pt) is what save_hierarchical_policy,
+        # train_full and the bot's own end-of-session saves write; the per-model
+        # folder layout ({dir}/executor/best_model.pt) is the train_*.py default.
+        for candidate in (dir_path / f"{name}.pt", dir_path / name / "best_model.pt"):
+            if candidate.exists():
+                return candidate
+        return None
+
+    loaded = []
+    path = _find("strategist")
+    if path:
+        strategist = load_strategist(str(path), device=device)
+        loaded.append(f"strategist={path}")
+    else:
+        print(f"[V2] WARNING: no strategist checkpoint in {dir_path} - using an untrained strategist")
+        strategist = create_strategist(config.strategist, device=device)
+
+    path = _find("tactician")
+    if path:
+        tactician = load_tactician(str(path), device=device)
+        loaded.append(f"tactician={path}")
+    else:
+        print(f"[V2] WARNING: no tactician checkpoint in {dir_path} - using an untrained tactician")
+        tactician = create_tactician(config.tactician, device=device)
+
+    path = _find("executor")
+    if path:
+        executor = load_executor(str(path), device=device)
+        loaded.append(f"executor={path}")
+    else:
+        print(f"[V2] WARNING: no executor checkpoint in {dir_path} - using an untrained executor")
+        executor = create_executor(config.executor, device=device)
+
+    if not loaded:
+        raise FileNotFoundError(
+            f"No policy checkpoints found in {dir_path} (looked for strategist/tactician/"
+            f"executor as <name>.pt or <name>/best_model.pt)")
+    print(f"[V2] Loaded policy: {', '.join(loaded)}")
 
     return HierarchicalPolicy(
         strategist=strategist,

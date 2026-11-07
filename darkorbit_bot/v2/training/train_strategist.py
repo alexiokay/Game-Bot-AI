@@ -789,7 +789,7 @@ def train_strategist(
         # Save best
         if val_metrics['total_loss'] < best_val_loss:
             best_val_loss = val_metrics['total_loss']
-            best_model_state = model.state_dict().copy()
+            best_model_state = {k: v.detach().clone() for k, v in model.state_dict().items()}  # real copy, not aliases of live weights
             print(f"   New best model!")
 
     # Load best

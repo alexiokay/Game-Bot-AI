@@ -457,6 +457,16 @@ class MouseController:
         if self._move_thread and self._move_thread.is_alive():
             self._move_thread.join(timeout=0.5)
 
+    def release_buttons(self):
+        """Send button-up for left and right (safe if they are not down)."""
+        if not self.available:
+            return
+        for button in ("left", "right"):
+            try:
+                self._send_click(False, button)
+            except Exception:
+                pass
+
     def normalized_to_screen(self, x: float, y: float) -> Tuple[int, int]:
         """Convert normalized (0-1) coordinates to screen pixels"""
         screen_x = int(self.game_rect["left"] + x * self.game_rect["width"])
@@ -849,6 +859,19 @@ class KeyboardController:
             return
 
         self._send_key(scan_code, key_up=True)
+
+    def release_all(self):
+        """Send key-up for every key the bot can press (modifiers first).
+        A key-up for a key that is not down is harmless, so this is safe to call
+        on stop, pause or crash to make sure nothing stays held."""
+        if not self.available:
+            return
+        order = ['shift', 'alt', 'ctrl'] + [k for k in self.SCAN_CODES if k not in ('shift', 'alt', 'ctrl')]
+        for key in order:
+            try:
+                self._send_key(self.SCAN_CODES[key], key_up=True)
+            except Exception:
+                pass
 
     def fire_rocket(self):
         """Fire a rocket (Space) using YOUR timing from recordings"""
