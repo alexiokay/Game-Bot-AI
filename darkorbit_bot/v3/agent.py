@@ -72,10 +72,11 @@ class Agent:
                  input_capture, profile: GameProfile, hud_reader=None, runner=None,
                  mouse=None, keyboard=None, movement=None,
                  monitor: Optional[Dict] = None, fps: Optional[int] = None,
-                 dry_run: bool = False, record_frames: bool = True):
+                 dry_run: bool = False, record_frames: bool = True, broadcaster=None):
         assert mode in ('record', 'bot')
         self.mode = mode
         self.profile = profile
+        self.broadcaster = broadcaster   # overlay.StateBroadcaster for the live viewer
         self.capture = capture
         self.detector = detector
         self.writer = writer
@@ -236,13 +237,25 @@ class Agent:
         }
         feats = self.features.step(record)
 
-        if controller == BOT and self.runner is not None:
+        if controller in (BOT, TAKEOVER) and self.runner is not None:
             action = self.runner.act(feats)
-            record['bot_action'] = {k: action[k] for k in ('mx', 'my', 'lmb', 'rmb', 'keys')}
-            record['bot_target'] = [action['target_idx'], round(action['target_prob'], 3)]
-            self._execute(action)
+            decision = {k: action[k] for k in ('mx', 'my', 'lmb', 'rmb', 'keys')}
+            record['bot_target'] = [action['target_track_id'], round(action['target_prob'], 3)]
+            if controller == BOT:
+                record['bot_action'] = decision
+                self._execute(action)
+            else:
+                # Takeover: you play; keep what the bot WOULD have done, for the
+                # overlay and for spotting where it disagrees with you
+                record['bot_suggestion'] = decision
 
         self.writer.add(record, frame if self.record_frames else None)
+        if self.broadcaster is not None and self.broadcaster.has_clients():
+            from .overlay import build_state
+            self.broadcaster.publish(
+                build_state(record, feats, self.profile,
+                            self.runner.last_debug if self.runner is not None else None),
+                frame)
         self.frames += 1
         if self.frames % (self.fps * 5) == 0:
             n = int(feats['mask'].sum())
@@ -287,6 +300,11 @@ class Agent:
                 self._listener.stop()
             except Exception:
                 pass
+        if self.broadcaster is not None:
+            try:
+                self.broadcaster.close()
+            except Exception:
+                pass
         try:
             self.writer.close()
             print(f"[V3] Session saved: {self.writer.dir} ({self.writer.n_records} frames, "
@@ -313,6 +331,8 @@ def main(argv=None):
     ap.add_argument('--no-hud', action='store_true')
     ap.add_argument('--dry-run', action='store_true', help='bot decides but sends no input')
     ap.add_argument('--device', default='auto')
+    ap.add_argument('--viewer-port', type=int, default=9998, help='live overlay port (127.0.0.1 only)')
+    ap.add_argument('--no-broadcast', action='store_true', help='disable the live overlay server')
     args = ap.parse_args(argv)
 
     profile = load_profile(args.game)
@@ -361,9 +381,19 @@ def main(argv=None):
         'policy': str(policy_path) if args.mode == 'bot' else None,
     }, root=root, record_video=not args.no_video, fps=fps, video_size=profile.video_size, profile=profile)
 
+    broadcaster = None
+    if not args.no_broadcast:
+        from .overlay import StateBroadcaster
+        try:
+            broadcaster = StateBroadcaster(port=args.viewer_port)
+            print(f'[V3] Live overlay on 127.0.0.1:{args.viewer_port} (python -m darkorbit_bot.v3.viewer --live)')
+        except OSError as e:
+            print(f'[V3] Live overlay disabled: {e}')
+
     agent = Agent(args.mode, capture, detector, writer, inp, profile, hud_reader=hud, runner=runner,
                   mouse=mouse, keyboard=keyboard, movement=movement, monitor=mon,
-                  fps=fps, dry_run=args.dry_run, record_frames=not args.no_video)
+                  fps=fps, dry_run=args.dry_run, record_frames=not args.no_video,
+                  broadcaster=broadcaster)
 
     # Ctrl+Break (launcher Stop) / SIGTERM: only ask the loop to stop
     def _sig(signum, frame):

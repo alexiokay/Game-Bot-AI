@@ -403,6 +403,12 @@ class BotLauncher:
             self._kill_process_tree(self._debug_viewer_process)
             self._debug_viewer_process = None
 
+        # Kill V3 overlay
+        v3_overlay = getattr(self, '_v3_overlay_process', None)
+        if v3_overlay and v3_overlay.poll() is None:
+            self._kill_process_tree(v3_overlay)
+        self._v3_overlay_process = None
+
         self.running = False
         self._debug_viewer_launched = False
 
@@ -481,6 +487,18 @@ class BotLauncher:
             fg_color="#00897B", hover_color="#00796B", text_color="white")
         self.btn_v3_bot.pack(fill="x", padx=10, pady=5)
         self.btn_v3_bot.bind("<Button-3>", lambda e: self.config_v3())
+
+        self.btn_v3_overlay = ctk.CTkButton(
+            left_panel, text="V3 Live Overlay", command=self.run_v3_overlay,
+            height=34, font=ctk.CTkFont(size=12),
+            fg_color="#455A64", hover_color="#37474F", text_color="white")
+        self.btn_v3_overlay.pack(fill="x", padx=10, pady=5)
+
+        self.btn_v3_replay = ctk.CTkButton(
+            left_panel, text="V3 Replay Session...", command=self.run_v3_replay,
+            height=34, font=ctk.CTkFont(size=12),
+            fg_color="#455A64", hover_color="#37474F", text_color="white")
+        self.btn_v3_replay.pack(fill="x", padx=10, pady=5)
 
         self._create_separator(left_panel)
 
@@ -886,6 +904,8 @@ class BotLauncher:
 
         main_proc = self.current_process
         viewer_proc = self._debug_viewer_process
+        v3_overlay = getattr(self, '_v3_overlay_process', None)
+        self._v3_overlay_process = None
         self.current_process = None
         self._debug_viewer_process = None
 
@@ -896,6 +916,8 @@ class BotLauncher:
                 self.root.after(0, self.log, f"[LAUNCHER] Asking main process (PID: {main_proc.pid}) to stop...")
                 self._kill_process_tree(main_proc, graceful_timeout=GRACEFUL_STOP_TIMEOUT)
                 self.root.after(0, self.log, "[LAUNCHER] Main process stopped")
+            if v3_overlay and v3_overlay.poll() is None:
+                self._kill_process_tree(v3_overlay)
             if viewer_proc:
                 self.root.after(0, self.log, f"[LAUNCHER] Killing debug viewer (PID: {viewer_proc.pid})...")
                 self._kill_process_tree(viewer_proc)
@@ -954,7 +976,7 @@ class BotLauncher:
         for widget in [self.btn_shadow, self.btn_record, self.btn_train_strategist,
                       self.btn_train_tactician, self.btn_train_executor, self.btn_finetune_vlm,
                       self.btn_run_bot, self.btn_tensorboard, self.btn_data_stats, self.btn_evaluate,
-                      self.btn_v3_record, self.btn_v3_train, self.btn_v3_bot]:
+                      self.btn_v3_record, self.btn_v3_train, self.btn_v3_bot, self.btn_v3_replay]:
             widget.configure(state="disabled")
         # Debug Viewer stays enabled - it's meant to connect to running bot
 
@@ -963,7 +985,8 @@ class BotLauncher:
         for widget in [self.btn_shadow, self.btn_record, self.btn_train_strategist,
                       self.btn_train_tactician, self.btn_train_executor, self.btn_finetune_vlm,
                       self.btn_run_bot, self.btn_debug_viewer, self.btn_tensorboard, self.btn_data_stats, self.btn_evaluate,
-                      self.btn_v3_record, self.btn_v3_train, self.btn_v3_bot]:
+                      self.btn_v3_record, self.btn_v3_train, self.btn_v3_bot, self.btn_v3_replay,
+                      self.btn_v3_overlay]:
             widget.configure(state="normal")
 
     # Configuration dialogs
@@ -1254,6 +1277,7 @@ class BotLauncher:
             ('no_video', 'Record without video', cfg.get('no_video', False), 'bool'),
             ('epochs', 'Training Epochs', cfg.get('epochs', 30), 'int'),
             ('awr', 'Reward-weighted training (AWR)', cfg.get('awr', False), 'bool'),
+            ('overlay', 'Open live overlay with Record / Run Bot', cfg.get('overlay', True), 'bool'),
         ]
         result = ConfigDialog(self.root, "V3 Single Policy Configuration", fields).show()
         if result:
@@ -1269,10 +1293,42 @@ class BotLauncher:
             cmd.append("--no-video")
         return cmd
 
+    def run_v3_overlay(self, delay: float = 0.0):
+        """Live decision overlay in its own window (runs alongside the agent)."""
+        def launch():
+            import time as _t
+            if delay:
+                _t.sleep(delay)
+            cmd = ["uv", "run", "python", "-m", "darkorbit_bot.v3.viewer", "--live"]
+            try:
+                self._v3_overlay_process = subprocess.Popen(
+                    cmd, cwd=str(BOT_DIR),
+                    creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == 'win32' else 0)
+                self.root.after(0, self.log, "[LAUNCHER] V3 overlay opened (q in its window closes it)")
+            except Exception as e:
+                self.root.after(0, self.log, f"[LAUNCHER] Could not open V3 overlay: {e}")
+        threading.Thread(target=launch, daemon=True).start()
+
+    def run_v3_replay(self):
+        """Pick a recorded session and replay it with the overlay (and the policy, if trained)."""
+        cfg = self.config.get('v3', {})
+        start_dir = BOT_DIR / "darkorbit_bot" / "data" / "v3_sessions" / self._v3_game(cfg)
+        folder = filedialog.askdirectory(title="Choose a V3 session folder",
+                                         initialdir=str(start_dir if start_dir.exists() else BOT_DIR))
+        if not folder:
+            return
+        cmd = ["uv", "run", "python", "-m", "darkorbit_bot.v3.viewer", "--replay", folder,
+               "--game", self._v3_game(cfg)]
+        if Path(self._v3_policy(cfg)).exists():
+            cmd += ["--policy", self._v3_policy(cfg)]
+        self.run_command(cmd, f"V3 Replay {Path(folder).name}", script_type='viewer')
+
     def run_v3_record(self):
         cfg = self.config.get('v3', {})
         cmd = ["uv", "run", "python", "-m", "darkorbit_bot.v3.agent", "--mode", "record"] + self._v3_common(cfg)
         self.run_command(cmd, f"V3 Record ({self._v3_game(cfg)})", script_type='v3')
+        if cfg.get('overlay', True):
+            self.run_v3_overlay(delay=4.0)
 
     def run_v3_train(self):
         cfg = self.config.get('v3', {})
@@ -1290,6 +1346,8 @@ class BotLauncher:
         if cfg.get('dry_run', True):
             cmd.append("--dry-run")
         self.run_command(cmd, "V3 Run Bot" + (" (dry run)" if cfg.get('dry_run', True) else ""), script_type='v3')
+        if cfg.get('overlay', True):
+            self.run_v3_overlay(delay=6.0)
 
     # Command runners
     def _yolo_model_path(self, cfg: dict) -> str:

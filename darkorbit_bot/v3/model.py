@@ -187,7 +187,9 @@ class PolicyRunner:
     def reset(self):
         self._step = 0
         self._chunks: List[Tuple[int, np.ndarray, np.ndarray]] = []  # (start, mouse[C,2], buttons[C,K])
-        self._last_target = (-1, 0.0)
+        self._last_target = (None, 0.0)   # (track id, probability)
+        self._replan_step = 0
+        self.last_debug: Dict = {}
 
     @torch.no_grad()
     def act(self, feats: Dict) -> Dict:
@@ -198,8 +200,19 @@ class PolicyRunner:
             mouse = torch.sigmoid(out['mouse_logits'])[0].cpu().numpy()
             buttons = torch.sigmoid(out['button_logits'])[0].cpu().numpy()
             probs = F.softmax(out['target_logits'], dim=1)[0].cpu().numpy()
+            N = self.model.cfg.max_objects
+            # Key target probabilities by TRACK ID: objects are re-sorted every
+            # frame, so an index from this replan would point at a different
+            # object on the next frames.
+            tracks = feats.get('tracks') or []
+            by_track = {int(o.track_id): float(probs[i]) for i, o in enumerate(tracks[:N])}
             ti = int(np.argmax(probs))
-            self._last_target = (ti if ti < self.model.cfg.max_objects else -1, float(probs[ti]))
+            tid = int(tracks[ti].track_id) if ti < min(N, len(tracks)) else None
+            self._last_target = (tid, float(probs[ti]))
+            self._replan_step = self._step
+            self.last_debug = {'target_probs': by_track, 'none_prob': float(probs[N]),
+                               'target_track_id': tid, 'chunk_mouse': mouse.tolist(),
+                               'chunk_buttons': buttons.tolist()}
             self._chunks.append((self._step, mouse, buttons))
             C = self.model.cfg.chunk
             self._chunks = [ch for ch in self._chunks if self._step - ch[0] < C]
@@ -213,6 +226,11 @@ class PolicyRunner:
             w_acc += w
         mouse_xy = mouse_acc / w_acc
         btn = btn_acc / w_acc
+        # For the overlay: the rest of the newest chunk = where the mouse goes next
+        k_now = self._step - self._replan_step
+        if self.last_debug:
+            self.last_debug['mouse_path'] = self.last_debug['chunk_mouse'][k_now:]
+            self.last_debug['button_probs'] = btn.tolist()
         self._step += 1
 
         th = self.button_threshold
@@ -220,5 +238,5 @@ class PolicyRunner:
             'mx': float(mouse_xy[0]), 'my': float(mouse_xy[1]),
             'lmb': bool(btn[0] > th), 'rmb': bool(btn[1] > th),
             'keys': [k for i, k in enumerate(self.keys) if btn[2 + i] > th],
-            'target_idx': self._last_target[0], 'target_prob': self._last_target[1],
+            'target_track_id': self._last_target[0], 'target_prob': self._last_target[1],
         }
